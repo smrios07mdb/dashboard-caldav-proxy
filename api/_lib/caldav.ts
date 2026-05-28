@@ -1,15 +1,13 @@
-// tsdav ships a CJS bundle; Node's cjs-module-lexer can't statically detect
-// its named exports, so direct named imports fail at module load with
-// "does not provide an export named X". Namespace import + runtime destructure works.
-import * as tsdav from 'tsdav';
-import type { DAVCalendar } from 'tsdav';
-
-const {
+// tsdav loaded via the local _lib/tsdav.ts wrapper (createRequire — see
+// that file for why). Importing from the wrapper rather than 'tsdav' directly
+// also makes vitest's vi.mock hook in normally.
+import {
   createCalendarObject,
   createDAVClient,
   fetchCalendarObjects,
   getBasicAuthHeaders,
-} = tsdav;
+  type DAVCalendar,
+} from './tsdav.js';
 
 const ICLOUD_CALDAV_URL = 'https://caldav.icloud.com/';
 

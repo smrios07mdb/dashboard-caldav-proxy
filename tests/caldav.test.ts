@@ -12,7 +12,7 @@ const {
   getBasicAuthHeadersMock: vi.fn(() => ({ authorization: 'Basic xxx' })),
 }));
 
-vi.mock('tsdav', () => ({
+vi.mock('../api/_lib/tsdav', () => ({
   createDAVClient: createDAVClientMock,
   fetchCalendarObjects: fetchCalendarObjectsMock,
   createCalendarObject: createCalendarObjectMock,
