@@ -1,10 +1,15 @@
-import {
+// tsdav ships a CJS bundle; Node's cjs-module-lexer can't statically detect
+// its named exports, so direct named imports fail at module load with
+// "does not provide an export named X". Namespace import + runtime destructure works.
+import * as tsdav from 'tsdav';
+import type { DAVCalendar } from 'tsdav';
+
+const {
   createCalendarObject,
   createDAVClient,
   fetchCalendarObjects,
   getBasicAuthHeaders,
-  type DAVCalendar,
-} from 'tsdav';
+} = tsdav;
 
 const ICLOUD_CALDAV_URL = 'https://caldav.icloud.com/';
 
