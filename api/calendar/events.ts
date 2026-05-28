@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { createEvent } from '../_lib/caldav';
-import { decrypt } from '../_lib/crypto';
-import { caldavErrorResponse, calendarRoute, jsonResponse } from '../_lib/http';
-import { byteaToBuffer, getSettings } from '../_lib/supabase';
+import { createEvent } from '../_lib/caldav.js';
+import { decrypt } from '../_lib/crypto.js';
+import { caldavErrorResponse, calendarRoute, jsonResponse } from '../_lib/http.js';
+import { byteaToBuffer, getSettings } from '../_lib/supabase.js';
 
 const Body = z.object({
   title: z.string().min(1),

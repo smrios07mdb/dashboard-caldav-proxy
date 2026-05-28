@@ -1,6 +1,6 @@
 import { z } from 'zod';
-import { CalDavError, discover } from '../_lib/caldav';
-import { calendarRoute, jsonResponse } from '../_lib/http';
+import { CalDavError, discover } from '../_lib/caldav.js';
+import { calendarRoute, jsonResponse } from '../_lib/http.js';
 
 const Body = z.object({
   apple_id: z.string().min(1),

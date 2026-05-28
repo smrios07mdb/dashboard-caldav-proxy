@@ -1,7 +1,7 @@
 import { z } from 'zod';
-import { encrypt } from '../_lib/crypto';
-import { calendarRoute, jsonResponse } from '../_lib/http';
-import { bufferToBytea, updateSettings } from '../_lib/supabase';
+import { encrypt } from '../_lib/crypto.js';
+import { calendarRoute, jsonResponse } from '../_lib/http.js';
+import { bufferToBytea, updateSettings } from '../_lib/supabase.js';
 
 const Body = z.object({
   apple_id: z.string().min(1),

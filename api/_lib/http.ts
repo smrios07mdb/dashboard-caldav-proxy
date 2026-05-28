@@ -1,6 +1,6 @@
-import { requireUser, UnauthorizedError } from './auth';
-import { CalDavError } from './caldav';
-import { updateSettings } from './supabase';
+import { requireUser, UnauthorizedError } from './auth.js';
+import { CalDavError } from './caldav.js';
+import { updateSettings } from './supabase.js';
 
 // Scheme+host origins only (no path). Browsers send the bare origin in `Origin`,
 // so exact matching against this allowlist is correct. Never reflect `*`.
