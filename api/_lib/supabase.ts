@@ -24,10 +24,17 @@ export interface CalDavSettings {
   caldav_app_password_encrypted: string | null;
   caldav_calendar_url: string | null;
   caldav_status: string | null;
+  // Outlook published-calendar ICS feed (read-only source).
+  outlook_ics_url_encrypted: string | null; // bytea, same `\x`-hex transport
+  outlook_feed_name: string | null;
+  outlook_status: string | null; // 'unconfigured' | 'ok' | 'unreachable'
+  outlook_cached_busy: unknown; // jsonb: last-good parse, OutlookBusyInterval[]
+  outlook_fetched_at: string | null;
 }
 
 const CALDAV_COLUMNS =
-  'caldav_apple_id, caldav_app_password_encrypted, caldav_calendar_url, caldav_status';
+  'caldav_apple_id, caldav_app_password_encrypted, caldav_calendar_url, caldav_status, ' +
+  'outlook_ics_url_encrypted, outlook_feed_name, outlook_status, outlook_cached_busy, outlook_fetched_at';
 
 export async function getSettings(userId: string): Promise<CalDavSettings | null> {
   const { data, error } = await getClient()

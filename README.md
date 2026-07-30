@@ -1,10 +1,11 @@
 # dashboard-caldav-proxy
 
-Vercel serverless functions that broker Apple iCloud calendar (CalDAV) for the
-`dashboard` app. iCloud requires Basic auth with an app-specific password, which
-a browser can't do safely (CORS + credential handling). This proxy stores the
-password **encrypted**, verifies the caller's Supabase JWT, and brokers every
-CalDAV call. See `ARCHITECTURE.md` §7 in the main `dashboard` repo for the
+Vercel serverless functions that broker calendar access for the `dashboard`
+app: Apple iCloud (CalDAV, read/write) and an Outlook published-calendar ICS
+feed (read-only). iCloud requires Basic auth with an app-specific password,
+which a browser can't do safely (CORS + credential handling). This proxy stores
+secrets **encrypted**, verifies the caller's Supabase JWT, and brokers every
+upstream call. See `ARCHITECTURE.md` §7 in the main `dashboard` repo for the
 canonical design.
 
 ## How it works
@@ -25,16 +26,61 @@ canonical design.
 All `/api/calendar/*` routes require a valid Supabase JWT and honor CORS for the
 origins in `ALLOWED_ORIGINS`.
 
-| Method & path                         | Body / query                               | Success                                    | Notable failures                                                  |
-| ------------------------------------- | ------------------------------------------ | ------------------------------------------ | ----------------------------------------------------------------- |
-| `GET /api/health`                     | —                                          | `{ ok: true }`                             | —                                                                 |
-| `POST /api/calendar/test-credentials` | `{ apple_id, app_password }`               | `{ ok: true, calendars: [{ url, name }] }` | `401 { error: "auth" }`, `400`                                    |
-| `POST /api/calendar/save-credentials` | `{ apple_id, app_password, calendar_url }` | `{ ok: true }`                             | `400`                                                             |
-| `GET /api/calendar/busy`              | `?from=<ISO>&to=<ISO>`                     | `{ ok: true, busy: [{ start, end }] }`     | `412 { error: "no_credentials" }`, `401 { error: "auth_failed" }` |
-| `POST /api/calendar/events`           | `{ title, start, end, description? }`      | `{ ok: true, uid }`                        | `412`, `401 { error: "auth_failed" }`                             |
+| Method & path                         | Body / query                               | Success                                                              | Notable failures                                                         |
+| ------------------------------------- | ------------------------------------------ | -------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `GET /api/health`                     | —                                          | `{ ok: true }`                                                       | —                                                                        |
+| `POST /api/calendar/test-credentials` | `{ apple_id, app_password }`               | `{ ok: true, calendars: [{ url, name }] }`                           | `401 { error: "auth" }`, `400`                                           |
+| `POST /api/calendar/save-credentials` | `{ apple_id, app_password, calendar_url }` | `{ ok: true }`                                                       | `400`                                                                    |
+| `GET /api/calendar/busy`              | `?from=<ISO>&to=<ISO>`                     | `{ ok: true, busy: [{ start, end, source, title? }], sources }`      | `412 { error: "no_credentials" }`, `401 { error: "auth_failed" }`        |
+| `POST /api/calendar/events`           | `{ title, start, end, description? }`      | `{ ok: true, uid }`                                                  | `412`, `401 { error: "auth_failed" }`                                    |
+| `POST /api/calendar/outlook`          | `{ icsUrl: string \| null }`               | `{ ok: true, feedName, eventCount }` / `{ ok: true, cleared: true }` | `422 { error: "invalid_url" \| "unreachable" \| "invalid_feed" }`, `400` |
 
 Missing/invalid JWT → `401 { ok: false, error: "unauthorized" }`. Upstream
 iCloud network/other failures → `502 { ok: false, error: "network" | "other" }`.
+
+`busy` returns `412 no_credentials` only when **neither** source is configured;
+one configured source is enough. Its `sources` key reports per-source health:
+
+```
+sources: {
+  icloud:  { configured, ok },
+  outlook: { configured, status: 'ok' | 'stale' | 'unconfigured', fetchedAt, feedName }
+}
+```
+
+## Outlook ICS
+
+A read-only second calendar source: the user pastes an Outlook **published
+calendar** ICS URL (Outlook → Settings → Calendar → Shared calendars → Publish).
+
+- **Storage** — the URL is a capability (anyone holding it can read the
+  calendar), so it is wrapped with the same AES-256-GCM path as the iCloud
+  password and stored in `settings.outlook_ics_url_encrypted` (`bytea`). It is
+  never logged or returned in any response.
+- **Save/verify** — `POST /api/calendar/outlook` fetches and parses the feed
+  over a 7-day smoke window before persisting anything; a failed verify returns
+  `422` and never overwrites a working config. `{ icsUrl: null }` disconnects
+  (all outlook columns reset).
+- **Freshness / stale cache** — there is no background refresh: every `busy`
+  call re-fetches the feed. On success the parse is cached in
+  `settings.outlook_cached_busy` (jsonb). If the feed later fails, `busy` serves
+  the cached intervals filtered to the requested window and reports
+  `sources.outlook.status: 'stale'` with the old `fetchedAt`, and
+  `outlook_status` flips to `'unreachable'` in the DB.
+- **SSRF constraints** — the feed URL is user-supplied and fetched server-side,
+  so `https:` only; literal-IP hosts (any encoding), `localhost`, and `.local`
+  hosts are rejected at the string level; redirects are re-validated hop by hop
+  (max 3) and may not leave https; 10s timeout; 2 MB response cap.
+- **Parsing** — `node-ical` with full recurrence expansion: RRULE, EXDATE,
+  RECURRENCE-ID overrides (an override replaces its base instance), VTIMEZONE/
+  TZID → UTC conversion, all-day events normalized to UTC midnight. Cancelled
+  (`STATUS:CANCELLED`) and free (`TRANSP:TRANSPARENT`) events are excluded.
+  Expansion is capped at 1000 instances per event as RRULE-bomb defense.
+
+An iCloud auth failure with Outlook configured no longer fails the whole `busy`
+response: the Outlook intervals are served with `sources.icloud.ok: false`, and
+`caldav_status='auth_failed'` is still recorded (reconnect banner logic is
+unchanged).
 
 ## Environment variables
 
@@ -139,9 +185,10 @@ curl -si "$BASE/api/calendar/busy?from=2026-06-01T00:00:00Z&to=2026-06-02T00:00:
 
 ## Security notes
 
-- The app-specific password is never stored or logged in plaintext, and decrypted
-  values never appear in logs or error messages.
+- The app-specific password and the Outlook ICS URL are never stored or logged
+  in plaintext, and decrypted values never appear in logs or error messages.
 - The service-role key lives only in Vercel env vars.
 - CORS is restricted to `ALLOWED_ORIGINS` — never `*`.
 - This repo ships **no** database migration; the `settings` CalDAV columns are
-  owned by the main `dashboard` repo (chunk 2).
+  owned by the main `dashboard` repo (chunk 2), and the `outlook_*` columns by
+  its `09_outlook_ics.sql` migration (chunk 35).

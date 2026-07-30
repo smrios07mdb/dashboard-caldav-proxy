@@ -102,6 +102,7 @@ export async function discover(
 export interface BusyInterval {
   start: string;
   end: string;
+  title?: string;
 }
 
 export async function getBusy(
@@ -165,29 +166,38 @@ function calendarName(c: DAVCalendar): string {
   return typeof dn === 'string' && dn.trim() ? dn : c.url;
 }
 
-/** Pull busy {start,end} intervals out of an iCalendar payload (VEVENT blocks). */
+/** Pull busy {start,end,title?} intervals out of an iCalendar payload (VEVENT blocks). */
 function parseEventIntervals(ical: string): BusyInterval[] {
   if (!ical) return [];
   const intervals: BusyInterval[] = [];
   let inEvent = false;
   let start: string | null = null;
   let end: string | null = null;
+  let title: string | null = null;
 
   for (const line of ical.split(/\r?\n/)) {
     if (line.startsWith('BEGIN:VEVENT')) {
       inEvent = true;
       start = null;
       end = null;
+      title = null;
     } else if (line.startsWith('END:VEVENT')) {
-      if (start && end) intervals.push({ start, end });
+      if (start && end) intervals.push({ start, end, ...(title ? { title } : {}) });
       inEvent = false;
     } else if (inEvent && line.startsWith('DTSTART')) {
       start = icalToIso(valueOf(line));
     } else if (inEvent && line.startsWith('DTEND')) {
       end = icalToIso(valueOf(line));
+    } else if (inEvent && line.startsWith('SUMMARY')) {
+      title = unescapeText(valueOf(line)) || null;
     }
   }
   return intervals;
+}
+
+/** Undo RFC 5545 TEXT escaping (\\ \; \, \n) for display; newlines become spaces. */
+function unescapeText(raw: string): string {
+  return raw.replace(/\\n/gi, ' ').replace(/\\([\\;,])/g, '$1');
 }
 
 function valueOf(line: string): string {

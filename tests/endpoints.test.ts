@@ -18,17 +18,24 @@ vi.mock('../api/_lib/supabase', async (io) => ({
   updateSettings: vi.fn(),
 }));
 vi.mock('../api/_lib/crypto', () => ({ encrypt: vi.fn(), decrypt: vi.fn() }));
+vi.mock('../api/_lib/ics', async (io) => ({
+  ...(await io<typeof import('../api/_lib/ics')>()),
+  fetchIcsFeed: vi.fn(),
+  parseIcsBusy: vi.fn(),
+}));
 
 import { requireUser, UnauthorizedError } from '../api/_lib/auth';
 import { CalDavError, createEvent, discover, getBusy } from '../api/_lib/caldav';
 import { getSettings, updateSettings } from '../api/_lib/supabase';
 import { decrypt, encrypt } from '../api/_lib/crypto';
+import { fetchIcsFeed, IcsError, parseIcsBusy } from '../api/_lib/ics';
 
 import health from '../api/health';
 import testCredentials from '../api/calendar/test-credentials';
 import saveCredentials from '../api/calendar/save-credentials';
 import busy from '../api/calendar/busy';
 import events from '../api/calendar/events';
+import outlook from '../api/calendar/outlook';
 
 const ORIGIN = 'https://user.github.io';
 const SETTINGS = {
@@ -36,6 +43,32 @@ const SETTINGS = {
   caldav_app_password_encrypted: '\\x6162', // bytea hex for "ab"
   caldav_calendar_url: 'https://caldav.icloud.com/1/calendars/home/',
   caldav_status: 'ok',
+  outlook_ics_url_encrypted: null,
+  outlook_feed_name: null,
+  outlook_status: 'unconfigured',
+  outlook_cached_busy: null,
+  outlook_fetched_at: null,
+};
+
+// Both sources configured; cache holds one interval inside the test window.
+const SETTINGS_BOTH = {
+  ...SETTINGS,
+  outlook_ics_url_encrypted: '\\x6f75', // bytea hex for "ou"
+  outlook_feed_name: 'Work Calendar',
+  outlook_status: 'ok',
+  outlook_cached_busy: [
+    { start: '2026-05-28T09:00:00.000Z', end: '2026-05-28T10:00:00.000Z', title: 'Cached' },
+    { start: '2026-06-20T09:00:00.000Z', end: '2026-06-20T10:00:00.000Z', title: 'Outside' },
+  ],
+  outlook_fetched_at: '2026-05-27T08:00:00.000Z',
+};
+
+const SETTINGS_OUTLOOK_ONLY = {
+  ...SETTINGS_BOTH,
+  caldav_apple_id: null,
+  caldav_app_password_encrypted: null,
+  caldav_calendar_url: null,
+  caldav_status: null,
 };
 
 beforeEach(() => {
@@ -177,22 +210,47 @@ describe('save-credentials', () => {
   });
 });
 
+interface BusyBody {
+  busy: Array<Record<string, unknown>>;
+  sources: {
+    icloud: { configured: boolean; ok: boolean };
+    outlook: {
+      configured: boolean;
+      status: string;
+      fetchedAt: string | null;
+      feedName: string | null;
+    };
+  };
+}
+const busyBody = (res: Response): Promise<BusyBody> => res.json() as Promise<BusyBody>;
+
 describe('busy', () => {
-  it('returns busy intervals on success', async () => {
+  const BUSY_URL =
+    'https://proxy/api/calendar/busy?from=2026-05-28T00:00:00Z&to=2026-05-29T00:00:00Z';
+
+  it('returns source-tagged intervals with titles (iCloud only)', async () => {
     vi.mocked(getSettings).mockResolvedValue(SETTINGS);
     vi.mocked(decrypt).mockResolvedValue('app-pw');
     vi.mocked(getBusy).mockResolvedValue([
-      { start: '2026-05-28T14:00:00.000Z', end: '2026-05-28T15:00:00.000Z' },
+      { start: '2026-05-28T14:00:00.000Z', end: '2026-05-28T15:00:00.000Z', title: 'Standup' },
     ]);
 
-    const res = await req(
-      busy,
-      'https://proxy/api/calendar/busy?from=2026-05-28T00:00:00Z&to=2026-05-29T00:00:00Z',
-    );
+    const res = await req(busy, BUSY_URL);
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({
       ok: true,
-      busy: [{ start: '2026-05-28T14:00:00.000Z', end: '2026-05-28T15:00:00.000Z' }],
+      busy: [
+        {
+          start: '2026-05-28T14:00:00.000Z',
+          end: '2026-05-28T15:00:00.000Z',
+          title: 'Standup',
+          source: 'icloud',
+        },
+      ],
+      sources: {
+        icloud: { configured: true, ok: true },
+        outlook: { configured: false, status: 'unconfigured', fetchedAt: null, feedName: null },
+      },
     });
     expect(getBusy).toHaveBeenCalledWith(
       SETTINGS.caldav_calendar_url,
@@ -201,27 +259,180 @@ describe('busy', () => {
       '2026-05-28T00:00:00Z',
       '2026-05-29T00:00:00Z',
     );
+    expect(fetchIcsFeed).not.toHaveBeenCalled();
   });
 
-  it('returns 412 when no credentials are stored', async () => {
+  it('returns 412 only when NEITHER source is configured', async () => {
     vi.mocked(getSettings).mockResolvedValue(null);
-    const res = await req(
-      busy,
-      'https://proxy/api/calendar/busy?from=2026-05-28T00:00:00Z&to=2026-05-29T00:00:00Z',
-    );
+    const res = await req(busy, BUSY_URL);
     expect(res.status).toBe(412);
     expect(getBusy).not.toHaveBeenCalled();
+    expect(fetchIcsFeed).not.toHaveBeenCalled();
   });
 
-  it('flips caldav_status to auth_failed and returns 401 on an iCloud auth failure', async () => {
+  it('serves 200 from an Outlook-only config', async () => {
+    vi.mocked(getSettings).mockResolvedValue(SETTINGS_OUTLOOK_ONLY);
+    vi.mocked(decrypt).mockResolvedValue('https://feed.example/cal.ics');
+    vi.mocked(fetchIcsFeed).mockResolvedValue({
+      raw: 'BEGIN:VCALENDAR',
+      feedName: 'Work Calendar',
+    });
+    vi.mocked(parseIcsBusy).mockReturnValue([
+      { start: '2026-05-28T09:00:00.000Z', end: '2026-05-28T10:00:00.000Z', title: 'Outlook mtg' },
+    ]);
+
+    const res = await req(busy, BUSY_URL);
+    expect(res.status).toBe(200);
+    const body = await busyBody(res);
+    expect(body.busy).toEqual([
+      {
+        start: '2026-05-28T09:00:00.000Z',
+        end: '2026-05-28T10:00:00.000Z',
+        title: 'Outlook mtg',
+        source: 'outlook',
+      },
+    ]);
+    expect(body.sources.icloud).toEqual({ configured: false, ok: false });
+    expect(body.sources.outlook).toMatchObject({
+      configured: true,
+      status: 'ok',
+      feedName: 'Work Calendar',
+    });
+    expect(getBusy).not.toHaveBeenCalled();
+    // Successful fetch refreshes the cache.
+    expect(updateSettings).toHaveBeenCalledWith(
+      'user-1',
+      expect.objectContaining({
+        outlook_status: 'ok',
+        outlook_cached_busy: [
+          {
+            start: '2026-05-28T09:00:00.000Z',
+            end: '2026-05-28T10:00:00.000Z',
+            title: 'Outlook mtg',
+          },
+        ],
+      }),
+    );
+  });
+
+  it('merges both sources sorted by start with correct tags', async () => {
+    vi.mocked(getSettings).mockResolvedValue(SETTINGS_BOTH);
+    vi.mocked(decrypt)
+      .mockResolvedValueOnce('app-pw') // iCloud password (decrypted first)
+      .mockResolvedValueOnce('https://feed.example/cal.ics');
+    vi.mocked(getBusy).mockResolvedValue([
+      { start: '2026-05-28T14:00:00.000Z', end: '2026-05-28T15:00:00.000Z', title: 'Apple' },
+    ]);
+    vi.mocked(fetchIcsFeed).mockResolvedValue({
+      raw: 'BEGIN:VCALENDAR',
+      feedName: 'Work Calendar',
+    });
+    vi.mocked(parseIcsBusy).mockReturnValue([
+      { start: '2026-05-28T09:00:00.000Z', end: '2026-05-28T10:00:00.000Z', title: 'Outlook' },
+    ]);
+
+    const res = await req(busy, BUSY_URL);
+    const body = await busyBody(res);
+    expect(body.busy).toEqual([
+      {
+        start: '2026-05-28T09:00:00.000Z',
+        end: '2026-05-28T10:00:00.000Z',
+        title: 'Outlook',
+        source: 'outlook',
+      },
+      {
+        start: '2026-05-28T14:00:00.000Z',
+        end: '2026-05-28T15:00:00.000Z',
+        title: 'Apple',
+        source: 'icloud',
+      },
+    ]);
+    expect(body.sources).toMatchObject({
+      icloud: { configured: true, ok: true },
+      outlook: { configured: true, status: 'ok' },
+    });
+  });
+
+  it('serves the cached parse with status stale when the feed is unreachable', async () => {
+    vi.mocked(getSettings).mockResolvedValue(SETTINGS_BOTH);
+    vi.mocked(decrypt)
+      .mockResolvedValueOnce('app-pw')
+      .mockResolvedValueOnce('https://feed.example/cal.ics');
+    vi.mocked(getBusy).mockResolvedValue([]);
+    vi.mocked(fetchIcsFeed).mockRejectedValue(new IcsError('unreachable', 'HTTP 503'));
+
+    const res = await req(busy, BUSY_URL);
+    expect(res.status).toBe(200);
+    const body = await busyBody(res);
+    // Cache filtered to the window: the 06-20 interval is dropped.
+    expect(body.busy).toEqual([
+      {
+        start: '2026-05-28T09:00:00.000Z',
+        end: '2026-05-28T10:00:00.000Z',
+        title: 'Cached',
+        source: 'outlook',
+      },
+    ]);
+    expect(body.sources.outlook).toEqual({
+      configured: true,
+      status: 'stale',
+      fetchedAt: '2026-05-27T08:00:00.000Z',
+      feedName: 'Work Calendar',
+    });
+    expect(updateSettings).toHaveBeenCalledWith('user-1', { outlook_status: 'unreachable' });
+  });
+
+  it('serves empty outlook intervals but still stale when unreachable with no cache', async () => {
+    vi.mocked(getSettings).mockResolvedValue({
+      ...SETTINGS_OUTLOOK_ONLY,
+      outlook_cached_busy: null,
+    });
+    vi.mocked(decrypt).mockResolvedValue('https://feed.example/cal.ics');
+    vi.mocked(fetchIcsFeed).mockRejectedValue(new IcsError('unreachable', 'timeout'));
+
+    const res = await req(busy, BUSY_URL);
+    expect(res.status).toBe(200);
+    const body = await busyBody(res);
+    expect(body.busy).toEqual([]);
+    expect(body.sources.outlook.status).toBe('stale');
+  });
+
+  it('iCloud auth failure with Outlook configured: 200, outlook intervals, side effect fires', async () => {
+    vi.mocked(getSettings).mockResolvedValue(SETTINGS_BOTH);
+    vi.mocked(decrypt)
+      .mockResolvedValueOnce('app-pw')
+      .mockResolvedValueOnce('https://feed.example/cal.ics');
+    vi.mocked(getBusy).mockRejectedValue(new CalDavError('auth', '401 Unauthorized'));
+    vi.mocked(fetchIcsFeed).mockResolvedValue({
+      raw: 'BEGIN:VCALENDAR',
+      feedName: 'Work Calendar',
+    });
+    vi.mocked(parseIcsBusy).mockReturnValue([
+      { start: '2026-05-28T09:00:00.000Z', end: '2026-05-28T10:00:00.000Z', title: 'Outlook' },
+    ]);
+
+    const res = await req(busy, BUSY_URL);
+    expect(res.status).toBe(200);
+    const body = await busyBody(res);
+    expect(body.busy).toEqual([
+      {
+        start: '2026-05-28T09:00:00.000Z',
+        end: '2026-05-28T10:00:00.000Z',
+        title: 'Outlook',
+        source: 'outlook',
+      },
+    ]);
+    expect(body.sources.icloud).toEqual({ configured: true, ok: false });
+    // The auth side effect still fires even though the response is 200.
+    expect(updateSettings).toHaveBeenCalledWith('user-1', { caldav_status: 'auth_failed' });
+  });
+
+  it('flips caldav_status to auth_failed and returns 401 on an iCloud auth failure (iCloud only)', async () => {
     vi.mocked(getSettings).mockResolvedValue(SETTINGS);
     vi.mocked(decrypt).mockResolvedValue('app-pw');
     vi.mocked(getBusy).mockRejectedValue(new CalDavError('auth', '401 Unauthorized'));
 
-    const res = await req(
-      busy,
-      'https://proxy/api/calendar/busy?from=2026-05-28T00:00:00Z&to=2026-05-29T00:00:00Z',
-    );
+    const res = await req(busy, BUSY_URL);
     expect(res.status).toBe(401);
     expect(await res.json()).toEqual({ ok: false, error: 'auth_failed' });
     expect(updateSettings).toHaveBeenCalledWith('user-1', { caldav_status: 'auth_failed' });
@@ -231,6 +442,70 @@ describe('busy', () => {
     vi.mocked(getSettings).mockResolvedValue(SETTINGS);
     const res = await req(busy, 'https://proxy/api/calendar/busy?from=2026-05-28T00:00:00Z');
     expect(res.status).toBe(400);
+  });
+});
+
+describe('outlook', () => {
+  const URL_ = 'https://proxy/api/calendar/outlook';
+  const ICS_URL = 'https://outlook.office365.com/owa/calendar/abc/calendar.ics';
+
+  it('verifies the feed, encrypts the URL, and persists config + cache', async () => {
+    vi.mocked(fetchIcsFeed).mockResolvedValue({
+      raw: 'BEGIN:VCALENDAR',
+      feedName: 'Work Calendar',
+    });
+    vi.mocked(parseIcsBusy).mockReturnValue([
+      { start: '2026-07-30T09:00:00.000Z', end: '2026-07-30T10:00:00.000Z', title: 'Mtg' },
+    ]);
+    vi.mocked(encrypt).mockResolvedValue(Buffer.from([0x0a, 0x0b]));
+
+    const res = await post(outlook, URL_, { icsUrl: ICS_URL });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, feedName: 'Work Calendar', eventCount: 1 });
+    expect(fetchIcsFeed).toHaveBeenCalledWith(ICS_URL);
+    expect(encrypt).toHaveBeenCalledWith(ICS_URL);
+    expect(updateSettings).toHaveBeenCalledWith(
+      'user-1',
+      expect.objectContaining({
+        outlook_ics_url_encrypted: '\\x0a0b',
+        outlook_feed_name: 'Work Calendar',
+        outlook_status: 'ok',
+        outlook_cached_busy: [
+          { start: '2026-07-30T09:00:00.000Z', end: '2026-07-30T10:00:00.000Z', title: 'Mtg' },
+        ],
+      }),
+    );
+  });
+
+  it.each(['invalid_url', 'unreachable', 'invalid_feed'] as const)(
+    'returns 422 %s and persists nothing on a failed verify',
+    async (kind) => {
+      vi.mocked(fetchIcsFeed).mockRejectedValue(new IcsError(kind, kind));
+      const res = await post(outlook, URL_, { icsUrl: ICS_URL });
+      expect(res.status).toBe(422);
+      expect(await res.json()).toEqual({ ok: false, error: kind });
+      expect(updateSettings).not.toHaveBeenCalled();
+    },
+  );
+
+  it('clears all outlook columns on icsUrl: null', async () => {
+    const res = await post(outlook, URL_, { icsUrl: null });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, cleared: true });
+    expect(updateSettings).toHaveBeenCalledWith('user-1', {
+      outlook_ics_url_encrypted: null,
+      outlook_feed_name: null,
+      outlook_status: 'unconfigured',
+      outlook_cached_busy: null,
+      outlook_fetched_at: null,
+    });
+    expect(fetchIcsFeed).not.toHaveBeenCalled();
+  });
+
+  it('returns 400 on an invalid body', async () => {
+    const res = await post(outlook, URL_, { icsUrl: 42 });
+    expect(res.status).toBe(400);
+    expect(updateSettings).not.toHaveBeenCalled();
   });
 });
 
