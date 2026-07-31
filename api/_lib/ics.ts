@@ -1,14 +1,13 @@
-// Outlook published-calendar ICS: fetch + parse + recurrence expansion.
-// Read-only counterpart to _lib/caldav.ts — same normalized-error philosophy
-// (tight buckets; a false-positive hard failure is worse than a false-negative).
-import ical, { type CalendarResponse, type VEvent } from 'node-ical';
+// Outlook published-calendar ICS: fetch-side concerns (SSRF checks, size cap,
+// redirects). Parsing/expansion delegates to _lib/busyExpand.ts, shared with
+// the CalDAV path. Read-only counterpart to _lib/caldav.ts — same
+// normalized-error philosophy (tight buckets; a false-positive hard failure
+// is worse than a false-negative).
+import { expandCalendarBusy } from './busyExpand.js';
 
 const FETCH_TIMEOUT_MS = 10_000;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const MAX_REDIRECTS = 3;
-// Per-event ceiling on expanded recurrence instances (defense against
-// pathological RRULEs like FREQ=SECONDLY over a wide window).
-const INSTANCE_CAP = 1000;
 
 export type IcsErrorKind = 'invalid_url' | 'unreachable' | 'invalid_feed';
 
@@ -167,92 +166,15 @@ function extractFeedName(raw: string): string | null {
 
 /**
  * Expand an ICS payload into busy intervals overlapping `[from, to)`.
- *
- * node-ical's `expandRecurringEvent` does the genuinely hard parts —
- * VTIMEZONE/TZID → UTC conversion, RRULE expansion, EXDATE exclusion, and
- * RECURRENCE-ID overrides replacing their base instance — and handles
- * non-recurring events as single instances, so every VEVENT goes through the
- * same path. `expandOngoing: true` gives overlap (not starts-within) semantics.
+ * Thin wrapper over the shared `expandCalendarBusy` (see busyExpand.ts for
+ * the expansion semantics: TZID → UTC, RRULE/EXDATE/RECURRENCE-ID, all-day
+ * exclusion). This level owns only the feed-shaped error contract: a payload
+ * node-ical can't parse is an 'invalid_feed'.
  */
 export function parseIcsBusy(raw: string, from: string, to: string): OutlookBusyInterval[] {
-  const fromMs = Date.parse(from);
-  const toMs = Date.parse(to);
-  if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || toMs <= fromMs) return [];
-
-  let parsed: CalendarResponse;
   try {
-    parsed = ical.sync.parseICS(raw);
+    return expandCalendarBusy(raw, from, to);
   } catch (err) {
     throw new IcsError('invalid_feed', err instanceof Error ? err.message : String(err));
   }
-
-  const out: OutlookBusyInterval[] = [];
-  for (const component of Object.values(parsed)) {
-    if (!isVEvent(component)) continue;
-    const event = component;
-
-    let instances: ReturnType<typeof ical.expandRecurringEvent>;
-    try {
-      instances = ical.expandRecurringEvent(event, {
-        from: new Date(fromMs),
-        to: new Date(toMs),
-        expandOngoing: true,
-      });
-    } catch {
-      // rrule-temporal throws past 10k iterations instead of truncating; a
-      // rule that pathological contributes nothing rather than failing the
-      // whole feed (silent truncation, per spec).
-      continue;
-    }
-    if (instances.length > INSTANCE_CAP) instances = instances.slice(0, INSTANCE_CAP);
-
-    for (const instance of instances) {
-      // `instance.event` is the base VEVENT or the RECURRENCE-ID override —
-      // checking it (not the parent) also drops cancelled single instances.
-      if (instance.event.status === 'CANCELLED') continue;
-      if (instance.event.transparency === 'TRANSPARENT') continue;
-
-      let startMs = instance.start.getTime();
-      let endMs = (instance.end ?? instance.start).getTime();
-      if (instance.isFullDay) {
-        // node-ical materializes DATE values at server-local midnight;
-        // normalize to UTC midnight (same convention as caldav.ts icalToIso).
-        startMs = localDateToUtcMidnight(instance.start);
-        endMs = localDateToUtcMidnight(instance.end ?? instance.start);
-      }
-      if (!(startMs < toMs && endMs > fromMs)) continue;
-
-      const title = summaryText(instance.summary ?? instance.event.summary);
-      out.push({
-        start: new Date(startMs).toISOString(),
-        end: new Date(endMs).toISOString(),
-        ...(title !== undefined ? { title } : {}),
-      });
-    }
-  }
-
-  out.sort((a, b) => a.start.localeCompare(b.start));
-  return out;
-}
-
-function isVEvent(component: unknown): component is VEvent {
-  return (
-    typeof component === 'object' &&
-    component !== null &&
-    'type' in component &&
-    (component as { type: unknown }).type === 'VEVENT'
-  );
-}
-
-function localDateToUtcMidnight(d: Date): number {
-  return Date.UTC(d.getFullYear(), d.getMonth(), d.getDate());
-}
-
-/** SUMMARY is a node-ical ParameterValue: a string, or `{ params, val }`. */
-function summaryText(summary: unknown): string | undefined {
-  const value =
-    typeof summary === 'object' && summary !== null && 'val' in summary
-      ? (summary as { val: unknown }).val
-      : summary;
-  return typeof value === 'string' && value.trim() ? value : undefined;
 }

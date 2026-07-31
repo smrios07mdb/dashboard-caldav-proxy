@@ -8,6 +8,7 @@ import {
   getBasicAuthHeaders,
   type DAVCalendar,
 } from './tsdav.js';
+import { expandCalendarBusy } from './busyExpand.js';
 
 const ICLOUD_CALDAV_URL = 'https://caldav.icloud.com/';
 
@@ -112,18 +113,35 @@ export async function getBusy(
   from: string,
   to: string,
 ): Promise<BusyInterval[]> {
+  let objects;
   try {
     const headers = getBasicAuthHeaders({ username: appleId, password });
-    const objects = await fetchCalendarObjects({
+    // No `expand: true`: tsdav re-fetches object data via calendar-multiget,
+    // which returns the raw unexpanded master VEVENT (DTSTART;TZID + RRULE
+    // intact) regardless of the expand flag. Expansion happens locally in
+    // expandCalendarBusy — one deterministic path shared with the ICS source.
+    objects = await fetchCalendarObjects({
       calendar: { url: calendarUrl },
       timeRange: { start: from, end: to },
-      expand: true,
       headers,
     });
-    return objects.flatMap((o) => parseEventIntervals(typeof o.data === 'string' ? o.data : ''));
   } catch (err) {
     throw classifyError(err);
   }
+
+  const intervals: BusyInterval[] = [];
+  for (const o of objects) {
+    if (typeof o.data !== 'string' || !o.data) continue;
+    try {
+      intervals.push(...expandCalendarBusy(o.data, from, to));
+    } catch {
+      // One unparseable object contributes nothing rather than failing the
+      // whole busy response (mirrors the ICS path's pathological-RRULE stance).
+      continue;
+    }
+  }
+  intervals.sort((a, b) => a.start.localeCompare(b.start));
+  return intervals;
 }
 
 export interface NewEvent {
@@ -164,67 +182,6 @@ export async function createEvent(
 function calendarName(c: DAVCalendar): string {
   const dn = c.displayName;
   return typeof dn === 'string' && dn.trim() ? dn : c.url;
-}
-
-/** Pull busy {start,end,title?} intervals out of an iCalendar payload (VEVENT blocks). */
-function parseEventIntervals(ical: string): BusyInterval[] {
-  if (!ical) return [];
-  const intervals: BusyInterval[] = [];
-  let inEvent = false;
-  let start: string | null = null;
-  let end: string | null = null;
-  let title: string | null = null;
-
-  for (const line of ical.split(/\r?\n/)) {
-    if (line.startsWith('BEGIN:VEVENT')) {
-      inEvent = true;
-      start = null;
-      end = null;
-      title = null;
-    } else if (line.startsWith('END:VEVENT')) {
-      if (start && end) intervals.push({ start, end, ...(title ? { title } : {}) });
-      inEvent = false;
-    } else if (inEvent && line.startsWith('DTSTART')) {
-      start = icalToIso(valueOf(line));
-    } else if (inEvent && line.startsWith('DTEND')) {
-      end = icalToIso(valueOf(line));
-    } else if (inEvent && line.startsWith('SUMMARY')) {
-      title = unescapeText(valueOf(line)) || null;
-    }
-  }
-  return intervals;
-}
-
-/** Undo RFC 5545 TEXT escaping (\\ \; \, \n) for display; newlines become spaces. */
-function unescapeText(raw: string): string {
-  return raw.replace(/\\n/gi, ' ').replace(/\\([\\;,])/g, '$1');
-}
-
-function valueOf(line: string): string {
-  const idx = line.indexOf(':');
-  return idx === -1 ? '' : line.slice(idx + 1).trim();
-}
-
-/**
- * Convert an iCal date/date-time to an ISO string. With `expand: true` iCloud
- * returns UTC instances, so Z/non-Z date-times are read as UTC; bare DATE values
- * (all-day) become UTC midnight. TZID-qualified floating times are approximated
- * as UTC — acceptable for an at-a-glance busy strip.
- */
-function icalToIso(raw: string): string | null {
-  const dateOnly = /^(\d{4})(\d{2})(\d{2})$/.exec(raw);
-  if (dateOnly) {
-    const [, y, m, d] = dateOnly;
-    return new Date(Date.UTC(Number(y), Number(m) - 1, Number(d))).toISOString();
-  }
-  const dt = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z?$/.exec(raw);
-  if (dt) {
-    const [, y, mo, d, h, mi, s] = dt;
-    return new Date(
-      Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(s)),
-    ).toISOString();
-  }
-  return null;
 }
 
 function buildVEvent(e: NewEvent): string {

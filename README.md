@@ -48,6 +48,16 @@ sources: {
 }
 ```
 
+**Busy expansion** — both sources expand through one shared path
+(`api/_lib/busyExpand.ts`, built on `node-ical`): VTIMEZONE/TZID → UTC
+conversion, RRULE recurrence expansion, EXDATE, RECURRENCE-ID overrides, and
+exclusion of cancelled/transparent events. iCloud objects are fetched raw and
+expanded locally (tsdav's `expand` flag is unreliable — its multiget re-fetch
+returns unexpanded masters). **All-day events are excluded from busy** for both
+sources: a birthday or "Rent Due" doesn't consume schedulable time, and
+including it would zero out a whole day's free capacity in the planner.
+Floating date-times (no TZID, no `Z`) parse as UTC.
+
 ## Outlook ICS
 
 A read-only second calendar source: the user pastes an Outlook **published
@@ -71,11 +81,11 @@ calendar** ICS URL (Outlook → Settings → Calendar → Shared calendars → P
   so `https:` only; literal-IP hosts (any encoding), `localhost`, and `.local`
   hosts are rejected at the string level; redirects are re-validated hop by hop
   (max 3) and may not leave https; 10s timeout; 2 MB response cap.
-- **Parsing** — `node-ical` with full recurrence expansion: RRULE, EXDATE,
-  RECURRENCE-ID overrides (an override replaces its base instance), VTIMEZONE/
-  TZID → UTC conversion, all-day events normalized to UTC midnight. Cancelled
-  (`STATUS:CANCELLED`) and free (`TRANSP:TRANSPARENT`) events are excluded.
-  Expansion is capped at 1000 instances per event as RRULE-bomb defense.
+- **Parsing** — the shared busy-expansion path (`api/_lib/busyExpand.ts`, see
+  above): RRULE, EXDATE, RECURRENCE-ID overrides (an override replaces its base
+  instance), VTIMEZONE/TZID → UTC conversion. Cancelled (`STATUS:CANCELLED`),
+  free (`TRANSP:TRANSPARENT`), and all-day events are excluded. Expansion is
+  capped at 1000 instances per event as RRULE-bomb defense.
 
 An iCloud auth failure with Outlook configured no longer fails the whole `busy`
 response: the Outlook intervals are served with `sources.icloud.ok: false`, and

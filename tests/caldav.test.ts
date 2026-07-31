@@ -98,12 +98,25 @@ describe('discover', () => {
 });
 
 // ── getBusy ──────────────────────────────────────────────────────────────────
+
+const vobject = (...eventLines: string[]): string =>
+  [
+    'BEGIN:VCALENDAR',
+    'VERSION:2.0',
+    'PRODID:-//test//EN',
+    'BEGIN:VEVENT',
+    'DTSTAMP:20260501T000000Z',
+    ...eventLines,
+    'END:VEVENT',
+    'END:VCALENDAR',
+  ].join('\r\n');
+
 describe('getBusy', () => {
-  it('parses VEVENT DTSTART/DTEND into busy intervals', async () => {
+  it('expands VEVENT objects into busy intervals without expand:true', async () => {
     fetchCalendarObjectsMock.mockResolvedValue([
       {
         url: 'https://caldav.icloud.com/1/calendars/home/evt.ics',
-        data: 'BEGIN:VEVENT\r\nUID:abc\r\nDTSTART:20260528T140000Z\r\nDTEND:20260528T150000Z\r\nEND:VEVENT',
+        data: vobject('UID:abc', 'DTSTART:20260528T140000Z', 'DTEND:20260528T150000Z'),
       },
     ]);
 
@@ -116,6 +129,115 @@ describe('getBusy', () => {
     );
 
     expect(busy).toEqual([{ start: '2026-05-28T14:00:00.000Z', end: '2026-05-28T15:00:00.000Z' }]);
+    // Expansion is local (busyExpand.ts) — tsdav's expand flag must stay off,
+    // since multiget ignores it and returns raw masters anyway.
+    expect(fetchCalendarObjectsMock.mock.calls[0]?.[0]).not.toHaveProperty('expand');
+  });
+
+  it('expands a TZID + RRULE master to the queried week\'s occurrence in UTC', async () => {
+    fetchCalendarObjectsMock.mockResolvedValue([
+      {
+        url: 'https://caldav.icloud.com/1/calendars/home/pago.ics',
+        data: [
+          'BEGIN:VCALENDAR',
+          'VERSION:2.0',
+          'BEGIN:VTIMEZONE',
+          'TZID:America/New_York',
+          'BEGIN:DAYLIGHT',
+          'TZOFFSETFROM:-0500',
+          'TZOFFSETTO:-0400',
+          'TZNAME:EDT',
+          'DTSTART:20070311T020000',
+          'RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU',
+          'END:DAYLIGHT',
+          'BEGIN:STANDARD',
+          'TZOFFSETFROM:-0400',
+          'TZOFFSETTO:-0500',
+          'TZNAME:EST',
+          'DTSTART:20071104T020000',
+          'RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU',
+          'END:STANDARD',
+          'END:VTIMEZONE',
+          'BEGIN:VEVENT',
+          'UID:pago',
+          'DTSTAMP:20260501T000000Z',
+          'DTSTART;TZID=America/New_York:20250701T100000',
+          'DTEND;TZID=America/New_York:20250701T103000',
+          'RRULE:FREQ=WEEKLY;BYDAY=FR',
+          'SUMMARY:Pago Tarjeta Sergio',
+          'END:VEVENT',
+          'END:VCALENDAR',
+        ].join('\r\n'),
+      },
+    ]);
+
+    const busy = await getBusy(
+      'https://caldav.icloud.com/1/calendars/home/',
+      'me@icloud.com',
+      'app-pw',
+      '2026-07-27T00:00:00Z',
+      '2026-08-03T00:00:00Z',
+    );
+
+    expect(busy).toEqual([
+      {
+        start: '2026-07-31T14:00:00.000Z',
+        end: '2026-07-31T14:30:00.000Z',
+        title: 'Pago Tarjeta Sergio',
+      },
+    ]);
+  });
+
+  it('skips a malformed object but keeps valid ones', async () => {
+    fetchCalendarObjectsMock.mockResolvedValue([
+      { url: 'https://caldav.icloud.com/1/calendars/home/bad.ics', data: 12345 },
+      { url: 'https://caldav.icloud.com/1/calendars/home/junk.ics', data: 'not an icalendar' },
+      {
+        url: 'https://caldav.icloud.com/1/calendars/home/good.ics',
+        data: vobject(
+          'UID:good',
+          'DTSTART:20260528T140000Z',
+          'DTEND:20260528T150000Z',
+          'SUMMARY:Kept',
+        ),
+      },
+    ]);
+
+    const busy = await getBusy(
+      'https://caldav.icloud.com/1/calendars/home/',
+      'me@icloud.com',
+      'app-pw',
+      '2026-05-28T00:00:00Z',
+      '2026-05-29T00:00:00Z',
+    );
+
+    expect(busy).toEqual([
+      { start: '2026-05-28T14:00:00.000Z', end: '2026-05-28T15:00:00.000Z', title: 'Kept' },
+    ]);
+  });
+
+  it('excludes all-day objects from busy', async () => {
+    fetchCalendarObjectsMock.mockResolvedValue([
+      {
+        url: 'https://caldav.icloud.com/1/calendars/home/rent.ics',
+        data: vobject(
+          'UID:rent',
+          'DTSTART;VALUE=DATE:20260528',
+          'DTEND;VALUE=DATE:20260529',
+          'SUMMARY:Rent Due',
+        ),
+      },
+    ]);
+
+    const busy = await getBusy(
+      'https://caldav.icloud.com/1/calendars/home/',
+      'me@icloud.com',
+      'app-pw',
+      '2026-05-28T00:00:00Z',
+      '2026-05-29T00:00:00Z',
+    );
+
+    expect(busy).toEqual([]);
   });
 
   it('maps a 401 to CalDavError(kind="auth")', async () => {

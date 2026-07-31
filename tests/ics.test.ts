@@ -129,7 +129,7 @@ describe('parseIcsBusy', () => {
     expect(busy.find((b) => b.start === '2026-07-08T11:00:00.000Z')?.title).toBe('Sync (moved)');
   });
 
-  it('normalizes all-day events to UTC midnight boundaries', () => {
+  it('excludes all-day events from busy (they do not consume schedulable time)', () => {
     const raw = vcal(
       ...vevent(
         'UID:a1',
@@ -138,9 +138,7 @@ describe('parseIcsBusy', () => {
         'SUMMARY:Vacation',
       ),
     );
-    expect(parseIcsBusy(raw, WINDOW.from, WINDOW.to)).toEqual([
-      { start: '2026-07-08T00:00:00.000Z', end: '2026-07-09T00:00:00.000Z', title: 'Vacation' },
-    ]);
+    expect(parseIcsBusy(raw, WINDOW.from, WINDOW.to)).toEqual([]);
   });
 
   it('converts TZID-qualified times to UTC correctly across a DST boundary', () => {
