@@ -20,7 +20,7 @@ export function corsHeaders(req: Request): Record<string, string> {
   const headers: Record<string, string> = { Vary: 'Origin' };
   if (origin && allowedOrigins().includes(origin)) {
     headers['Access-Control-Allow-Origin'] = origin;
-    headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS';
+    headers['Access-Control-Allow-Methods'] = 'GET, POST, PATCH, DELETE, OPTIONS';
     headers['Access-Control-Allow-Headers'] = 'Authorization, Content-Type';
     headers['Access-Control-Max-Age'] = '86400';
   }

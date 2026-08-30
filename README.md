@@ -31,8 +31,10 @@ origins in `ALLOWED_ORIGINS`.
 | `GET /api/health`                     | —                                          | `{ ok: true }`                                                       | —                                                                        |
 | `POST /api/calendar/test-credentials` | `{ apple_id, app_password }`               | `{ ok: true, calendars: [{ url, name }] }`                           | `401 { error: "auth" }`, `400`                                           |
 | `POST /api/calendar/save-credentials` | `{ apple_id, app_password, calendar_url }` | `{ ok: true }`                                                       | `400`                                                                    |
-| `GET /api/calendar/busy`              | `?from=<ISO>&to=<ISO>`                     | `{ ok: true, busy: [{ start, end, source, title? }], sources }`      | `412 { error: "no_credentials" }`, `401 { error: "auth_failed" }`        |
-| `POST /api/calendar/events`           | `{ title, start, end, description? }`      | `{ ok: true, uid }`                                                  | `412`, `401 { error: "auth_failed" }`                                    |
+| `GET /api/calendar/busy`              | `?from=<ISO>&to=<ISO>`                     | `{ ok: true, busy: [{ start, end, source, title? }], plannerEvents, sources }` | `412 { error: "no_credentials" }`, `401 { error: "auth_failed" }`        |
+| `POST /api/calendar/events`           | `{ title, start, end, description?, source?: 'planner' }` | `{ ok: true, uid }`                                   | `412`, `401 { error: "auth_failed" }`                                    |
+| `PATCH /api/calendar/events`          | `{ uid, title, start, end, description? }` | `{ ok: true }`                                                       | `400`, `412`, `401 { error: "auth_failed" }`                             |
+| `DELETE /api/calendar/events?uid=…`   | —                                          | `{ ok: true }` / `{ ok: true, missing: true }` (already gone)        | `400`, `412`, `401 { error: "auth_failed" }`                             |
 | `POST /api/calendar/outlook`          | `{ icsUrl: string \| null }`               | `{ ok: true, feedName, eventCount }` / `{ ok: true, cleared: true }` | `422 { error: "invalid_url" \| "unreachable" \| "invalid_feed" }`, `400` |
 
 Missing/invalid JWT → `401 { ok: false, error: "unauthorized" }`. Upstream
@@ -47,6 +49,31 @@ sources: {
   outlook: { configured, status: 'ok' | 'stale' | 'unconfigured', fetchedAt, feedName }
 }
 ```
+
+## Planner block mirror (chunk 39)
+
+The dashboard's Week Planner can mirror its scheduled blocks to the selected
+iCloud calendar (opt-in, `settings.planner_writeout`). The proxy's part:
+
+- **UID convention.** `POST /api/calendar/events` with `source: 'planner'`
+  generates `uid = 'hupo-block-' + randomUUID()` (`PLANNER_UID_PREFIX` in
+  `api/_lib/caldav.ts`) and defaults `DESCRIPTION` to `Planned in Hupomnemata`.
+  Without `source` the endpoint is unchanged (plain UUID, counts as busy).
+- **Update.** `PATCH /api/calendar/events` rebuilds the whole VEVENT from the
+  body and PUTs it to `<calendar_url><uid>.ics` unconditionally (no etag /
+  `If-Match`) — the old object is never read. `title`, `start`, `end` are all
+  required.
+- **Delete.** `DELETE /api/calendar/events?uid=…` removes the object; an
+  upstream 404 answers `200 { ok: true, missing: true }` so deletes are
+  idempotent.
+- **`uid` validation.** `^[A-Za-z0-9-]{1,80}$` — no path characters; anything
+  else is `400 invalid_request`.
+- **Busy exclusion.** In `busy`, an iCloud object whose data carries a
+  `UID:hupo-block-…` line is **not** expanded into `busy`; its uid and first
+  expanded `[start, end]` go to the top-level `plannerEvents` array instead
+  (the app already counts the block as scheduled, and uses this list to
+  reconcile orphans and time drift). Outlook output is untouched;
+  `plannerEvents` is `[]` when iCloud isn't configured.
 
 **Busy expansion** — both sources expand through one shared path
 (`api/_lib/busyExpand.ts`, built on `node-ical`): VTIMEZONE/TZID → UTC
@@ -184,6 +211,23 @@ curl -sX POST "$BASE/api/calendar/save-credentials" \
 curl -sX POST "$BASE/api/calendar/events" \
   -H "Authorization: Bearer $JWT" -H 'Content-Type: application/json' \
   -d '{"title":"Proxy test","start":"2026-06-01T15:00:00Z","end":"2026-06-01T15:30:00Z"}'
+
+# 3b) Planner mirror round trip (chunk 39): create tagged → PATCH → busy → DELETE ×2
+curl -sX POST "$BASE/api/calendar/events" \
+  -H "Authorization: Bearer $JWT" -H 'Content-Type: application/json' \
+  -d '{"title":"Planner probe","start":"2026-06-01T16:00:00Z","end":"2026-06-01T16:30:00Z","source":"planner"}'
+#    → {"ok":true,"uid":"hupo-block-<uuid>"}   (export UID=hupo-block-<uuid>)
+curl -sX PATCH "$BASE/api/calendar/events" \
+  -H "Authorization: Bearer $JWT" -H 'Content-Type: application/json' \
+  -d "{\"uid\":\"$UID\",\"title\":\"Planner probe (moved)\",\"start\":\"2026-06-01T17:00:00Z\",\"end\":\"2026-06-01T17:30:00Z\"}"
+#    → {"ok":true}; Calendar.app shows the event at the new time
+curl -s "$BASE/api/calendar/busy?from=2026-06-01T00:00:00Z&to=2026-06-02T00:00:00Z" \
+  -H "Authorization: Bearer $JWT"
+#    → plannerEvents contains {uid:$UID, start:17:00Z, end:17:30Z}; busy does NOT contain 17:00–17:30
+curl -sX DELETE "$BASE/api/calendar/events?uid=$UID" -H "Authorization: Bearer $JWT"
+#    → {"ok":true}
+curl -sX DELETE "$BASE/api/calendar/events?uid=$UID" -H "Authorization: Bearer $JWT"
+#    → {"ok":true,"missing":true}
 
 # 4) Busy for a range
 curl -s "$BASE/api/calendar/busy?from=2026-06-01T00:00:00Z&to=2026-06-02T00:00:00Z" \

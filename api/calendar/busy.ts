@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { CalDavError, getBusy } from '../_lib/caldav.js';
+import { CalDavError, getBusy, type PlannerEvent } from '../_lib/caldav.js';
 import { decrypt } from '../_lib/crypto.js';
 import { caldavErrorResponse, calendarRoute, jsonResponse } from '../_lib/http.js';
 import { fetchIcsFeed, IcsError, parseIcsBusy, type OutlookBusyInterval } from '../_lib/ics.js';
@@ -51,20 +51,24 @@ export default {
     }
 
     const merged: TaggedInterval[] = [];
+    // Planner-block mirrors (chunk 39): iCloud only, never busy — reported so
+    // the app can reconcile orphans/drift. `[]` when iCloud isn't configured.
+    let plannerEvents: PlannerEvent[] = [];
 
     // ── iCloud ───────────────────────────────────────────────────────────────
     let icloudOk = Boolean(icloudCreds);
     if (icloudCreds) {
       const password = await decrypt(byteaToBuffer(icloudCreds.passwordEncrypted));
       try {
-        const intervals = await getBusy(
+        const result = await getBusy(
           icloudCreds.calendarUrl,
           icloudCreds.appleId,
           password,
           from,
           to,
         );
-        merged.push(...intervals.map((i) => ({ ...i, source: 'icloud' as const })));
+        merged.push(...result.intervals.map((i) => ({ ...i, source: 'icloud' as const })));
+        plannerEvents = result.plannerEvents;
       } catch (err) {
         // iCloud-only: keep the legacy contract (401 auth_failed / 502) that
         // existing clients key off. With Outlook configured, one dead source
@@ -113,6 +117,7 @@ export default {
     return jsonResponse(req, 200, {
       ok: true,
       busy: merged,
+      plannerEvents,
       sources: {
         icloud: { configured: Boolean(icloudCreds), ok: icloudOk },
         outlook: {

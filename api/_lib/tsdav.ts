@@ -17,6 +17,8 @@ const require = createRequire(import.meta.url);
 const tsdav = require('tsdav') as typeof import('tsdav');
 
 export const createCalendarObject = tsdav.createCalendarObject;
+export const updateCalendarObject = tsdav.updateCalendarObject;
+export const deleteCalendarObject = tsdav.deleteCalendarObject;
 export const createDAVClient = tsdav.createDAVClient;
 export const fetchCalendarObjects = tsdav.fetchCalendarObjects;
 export const getBasicAuthHeaders = tsdav.getBasicAuthHeaders;

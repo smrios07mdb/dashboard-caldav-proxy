@@ -4,13 +4,24 @@
 import {
   createCalendarObject,
   createDAVClient,
+  deleteCalendarObject,
   fetchCalendarObjects,
   getBasicAuthHeaders,
+  updateCalendarObject,
   type DAVCalendar,
 } from './tsdav.js';
 import { expandCalendarBusy } from './busyExpand.js';
 
 const ICLOUD_CALDAV_URL = 'https://caldav.icloud.com/';
+
+/**
+ * UID prefix that tags a VEVENT as a Week Planner block mirror (chunk 39).
+ * Objects carrying it are excluded from busy intervals and reported via
+ * `plannerEvents` instead, so the planner never counts a block twice (once
+ * as scheduled, once as busy). The chunk-13 Block Time sheet keeps plain
+ * UUIDs and stays busy.
+ */
+export const PLANNER_UID_PREFIX = 'hupo-block-';
 
 export type CalDavErrorKind = 'auth' | 'network' | 'other';
 
@@ -106,13 +117,27 @@ export interface BusyInterval {
   title?: string;
 }
 
+/** A planner-block mirror found on the calendar (first expanded instance). */
+export interface PlannerEvent {
+  uid: string;
+  start: string;
+  end: string;
+}
+
+export interface BusyResult {
+  intervals: BusyInterval[];
+  plannerEvents: PlannerEvent[];
+}
+
+const PLANNER_UID_RE = /^UID:(hupo-block-[A-Za-z0-9-]+)\s*$/m;
+
 export async function getBusy(
   calendarUrl: string,
   appleId: string,
   password: string,
   from: string,
   to: string,
-): Promise<BusyInterval[]> {
+): Promise<BusyResult> {
   let objects;
   try {
     const headers = getBasicAuthHeaders({ username: appleId, password });
@@ -130,10 +155,22 @@ export async function getBusy(
   }
 
   const intervals: BusyInterval[] = [];
+  const plannerEvents: PlannerEvent[] = [];
   for (const o of objects) {
     if (typeof o.data !== 'string' || !o.data) continue;
     try {
-      intervals.push(...expandCalendarBusy(o.data, from, to));
+      const expanded = expandCalendarBusy(o.data, from, to);
+      const planner = PLANNER_UID_RE.exec(o.data);
+      if (planner) {
+        // A planner mirror: not busy (the client already counts the block as
+        // scheduled); reported on the side so the app can reconcile orphans
+        // and time drift. Non-recurring by construction — first instance.
+        const first = expanded[0];
+        const uid = planner[1];
+        if (first && uid) plannerEvents.push({ uid, start: first.start, end: first.end });
+        continue;
+      }
+      intervals.push(...expanded);
     } catch {
       // One unparseable object contributes nothing rather than failing the
       // whole busy response (mirrors the ICS path's pathological-RRULE stance).
@@ -141,7 +178,8 @@ export async function getBusy(
     }
   }
   intervals.sort((a, b) => a.start.localeCompare(b.start));
-  return intervals;
+  plannerEvents.sort((a, b) => a.start.localeCompare(b.start));
+  return { intervals, plannerEvents };
 }
 
 export interface NewEvent {
@@ -177,7 +215,78 @@ export async function createEvent(
   }
 }
 
+/**
+ * Overwrite the VEVENT at `<calendarUrl><uid>.ics` (chunk 39). The whole
+ * object is rebuilt from `event` — the old one is never read — and the PUT
+ * is unconditional (no etag / If-Match): `scheduled_blocks` is the source of
+ * truth and the calendar copy is a mirror, so last-writer-wins is the point.
+ */
+export async function updateEvent(
+  calendarUrl: string,
+  appleId: string,
+  password: string,
+  event: NewEvent,
+): Promise<void> {
+  const headers = getBasicAuthHeaders({ username: appleId, password });
+
+  let res: Response;
+  try {
+    // objectUrl is inside the try: a malformed stored calendar_url classifies
+    // as 'other' (502) rather than escaping as a raw TypeError (500).
+    res = await updateCalendarObject({
+      calendarObject: { url: objectUrl(calendarUrl, event.uid), data: buildVEvent(event) },
+      headers,
+    });
+  } catch (err) {
+    throw classifyError(err);
+  }
+
+  if (!res.ok) {
+    throw classifyError(new Error(`CalDAV request failed: ${res.status}`));
+  }
+}
+
+/**
+ * Delete the VEVENT at `<calendarUrl><uid>.ics` (chunk 39). Idempotent: an
+ * upstream 404 resolves `{ missing: true }` rather than throwing, so a retry
+ * (or a reconcile racing a user delete) is a no-op instead of an error.
+ */
+export async function deleteEvent(
+  calendarUrl: string,
+  appleId: string,
+  password: string,
+  uid: string,
+): Promise<{ missing: boolean }> {
+  const headers = getBasicAuthHeaders({ username: appleId, password });
+
+  let res: Response;
+  try {
+    res = await deleteCalendarObject({
+      calendarObject: { url: objectUrl(calendarUrl, uid) },
+      headers,
+    });
+  } catch (err) {
+    throw classifyError(err);
+  }
+
+  if (res.status === 404) return { missing: true };
+  if (!res.ok) {
+    throw classifyError(new Error(`CalDAV request failed: ${res.status}`));
+  }
+  return { missing: false };
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * The object URL for a uid, built exactly the way tsdav's
+ * `createCalendarObject` resolves `filename` against `calendar.url`
+ * (`new URL(filename, calendar.url)`), so update/delete address the same
+ * resource create wrote — including the same trailing-slash behavior.
+ */
+function objectUrl(calendarUrl: string, uid: string): string {
+  return new URL(`${uid}.ics`, calendarUrl).href;
+}
 
 function calendarName(c: DAVCalendar): string {
   const dn = c.displayName;

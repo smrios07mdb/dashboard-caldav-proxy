@@ -11,6 +11,8 @@ vi.mock('../api/_lib/caldav', async (io) => ({
   discover: vi.fn(),
   getBusy: vi.fn(),
   createEvent: vi.fn(),
+  updateEvent: vi.fn(),
+  deleteEvent: vi.fn(),
 }));
 vi.mock('../api/_lib/supabase', async (io) => ({
   ...(await io<typeof import('../api/_lib/supabase')>()),
@@ -25,7 +27,14 @@ vi.mock('../api/_lib/ics', async (io) => ({
 }));
 
 import { requireUser, UnauthorizedError } from '../api/_lib/auth';
-import { CalDavError, createEvent, discover, getBusy } from '../api/_lib/caldav';
+import {
+  CalDavError,
+  createEvent,
+  deleteEvent,
+  discover,
+  getBusy,
+  updateEvent,
+} from '../api/_lib/caldav';
 import { getSettings, updateSettings } from '../api/_lib/supabase';
 import { decrypt, encrypt } from '../api/_lib/crypto';
 import { fetchIcsFeed, IcsError, parseIcsBusy } from '../api/_lib/ics';
@@ -128,6 +137,11 @@ describe('CORS', () => {
     );
     expect(res.status).toBe(204);
     expect(res.headers.get('access-control-allow-origin')).toBe(ORIGIN);
+    // chunk 39: the events route is method-dispatched — the preflight must
+    // advertise PATCH and DELETE or the browser never sends them.
+    expect(res.headers.get('access-control-allow-methods')).toBe(
+      'GET, POST, PATCH, DELETE, OPTIONS',
+    );
   });
 
   it('never echoes a wildcard or a disallowed origin', async () => {
@@ -212,6 +226,7 @@ describe('save-credentials', () => {
 
 interface BusyBody {
   busy: Array<Record<string, unknown>>;
+  plannerEvents: Array<{ uid: string; start: string; end: string }>;
   sources: {
     icloud: { configured: boolean; ok: boolean };
     outlook: {
@@ -231,9 +246,12 @@ describe('busy', () => {
   it('returns source-tagged intervals with titles (iCloud only)', async () => {
     vi.mocked(getSettings).mockResolvedValue(SETTINGS);
     vi.mocked(decrypt).mockResolvedValue('app-pw');
-    vi.mocked(getBusy).mockResolvedValue([
-      { start: '2026-05-28T14:00:00.000Z', end: '2026-05-28T15:00:00.000Z', title: 'Standup' },
-    ]);
+    vi.mocked(getBusy).mockResolvedValue({
+      intervals: [
+        { start: '2026-05-28T14:00:00.000Z', end: '2026-05-28T15:00:00.000Z', title: 'Standup' },
+      ],
+      plannerEvents: [],
+    });
 
     const res = await req(busy, BUSY_URL);
     expect(res.status).toBe(200);
@@ -247,6 +265,7 @@ describe('busy', () => {
           source: 'icloud',
         },
       ],
+      plannerEvents: [],
       sources: {
         icloud: { configured: true, ok: true },
         outlook: { configured: false, status: 'unconfigured', fetchedAt: null, feedName: null },
@@ -260,6 +279,58 @@ describe('busy', () => {
       '2026-05-29T00:00:00Z',
     );
     expect(fetchIcsFeed).not.toHaveBeenCalled();
+  });
+
+  it('reports planner mirrors in plannerEvents, never in busy (iCloud)', async () => {
+    vi.mocked(getSettings).mockResolvedValue(SETTINGS);
+    vi.mocked(decrypt).mockResolvedValue('app-pw');
+    vi.mocked(getBusy).mockResolvedValue({
+      intervals: [
+        { start: '2026-05-28T14:00:00.000Z', end: '2026-05-28T15:00:00.000Z', title: 'Standup' },
+      ],
+      plannerEvents: [
+        { uid: 'hupo-block-1', start: '2026-05-28T09:00:00.000Z', end: '2026-05-28T09:30:00.000Z' },
+      ],
+    });
+
+    const res = await req(busy, BUSY_URL);
+    const body = await busyBody(res);
+    expect(body.busy).toEqual([
+      {
+        start: '2026-05-28T14:00:00.000Z',
+        end: '2026-05-28T15:00:00.000Z',
+        title: 'Standup',
+        source: 'icloud',
+      },
+    ]);
+    expect(body.plannerEvents).toEqual([
+      { uid: 'hupo-block-1', start: '2026-05-28T09:00:00.000Z', end: '2026-05-28T09:30:00.000Z' },
+    ]);
+  });
+
+  it('plannerEvents is [] when iCloud is not configured; Outlook output unchanged', async () => {
+    vi.mocked(getSettings).mockResolvedValue(SETTINGS_OUTLOOK_ONLY);
+    vi.mocked(decrypt).mockResolvedValue('https://feed.example/cal.ics');
+    vi.mocked(fetchIcsFeed).mockResolvedValue({
+      raw: 'BEGIN:VCALENDAR',
+      feedName: 'Work Calendar',
+    });
+    vi.mocked(parseIcsBusy).mockReturnValue([
+      { start: '2026-05-28T09:00:00.000Z', end: '2026-05-28T10:00:00.000Z', title: 'Outlook' },
+    ]);
+
+    const res = await req(busy, BUSY_URL);
+    const body = await busyBody(res);
+    expect(body.plannerEvents).toEqual([]);
+    expect(body.busy).toEqual([
+      {
+        start: '2026-05-28T09:00:00.000Z',
+        end: '2026-05-28T10:00:00.000Z',
+        title: 'Outlook',
+        source: 'outlook',
+      },
+    ]);
+    expect(getBusy).not.toHaveBeenCalled();
   });
 
   it('returns 412 only when NEITHER source is configured', async () => {
@@ -320,9 +391,12 @@ describe('busy', () => {
     vi.mocked(decrypt)
       .mockResolvedValueOnce('app-pw') // iCloud password (decrypted first)
       .mockResolvedValueOnce('https://feed.example/cal.ics');
-    vi.mocked(getBusy).mockResolvedValue([
-      { start: '2026-05-28T14:00:00.000Z', end: '2026-05-28T15:00:00.000Z', title: 'Apple' },
-    ]);
+    vi.mocked(getBusy).mockResolvedValue({
+      intervals: [
+        { start: '2026-05-28T14:00:00.000Z', end: '2026-05-28T15:00:00.000Z', title: 'Apple' },
+      ],
+      plannerEvents: [],
+    });
     vi.mocked(fetchIcsFeed).mockResolvedValue({
       raw: 'BEGIN:VCALENDAR',
       feedName: 'Work Calendar',
@@ -358,7 +432,7 @@ describe('busy', () => {
     vi.mocked(decrypt)
       .mockResolvedValueOnce('app-pw')
       .mockResolvedValueOnce('https://feed.example/cal.ics');
-    vi.mocked(getBusy).mockResolvedValue([]);
+    vi.mocked(getBusy).mockResolvedValue({ intervals: [], plannerEvents: [] });
     vi.mocked(fetchIcsFeed).mockRejectedValue(new IcsError('unreachable', 'HTTP 503'));
 
     const res = await req(busy, BUSY_URL);
@@ -558,5 +632,167 @@ describe('events', () => {
     });
     expect(res.status).toBe(412);
     expect(createEvent).not.toHaveBeenCalled();
+  });
+  it('POST with source: planner prefixes the uid and defaults the description', async () => {
+    vi.mocked(getSettings).mockResolvedValue(SETTINGS);
+    vi.mocked(decrypt).mockResolvedValue('app-pw');
+    vi.mocked(createEvent).mockResolvedValue(undefined);
+
+    const res = await post(events, 'https://proxy/api/calendar/events', {
+      title: 'Draft brief',
+      start: '2026-05-28T14:00:00Z',
+      end: '2026-05-28T15:00:00Z',
+      source: 'planner',
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; uid: string };
+    expect(body.uid).toMatch(/^hupo-block-[0-9a-f-]{36}$/);
+    expect(vi.mocked(createEvent).mock.calls[0]?.[3]).toMatchObject({
+      uid: body.uid,
+      description: 'Planned in Hupomnemata',
+    });
+  });
+
+  it('POST with an explicit description keeps it even for planner events', async () => {
+    vi.mocked(getSettings).mockResolvedValue(SETTINGS);
+    vi.mocked(decrypt).mockResolvedValue('app-pw');
+    vi.mocked(createEvent).mockResolvedValue(undefined);
+
+    await post(events, 'https://proxy/api/calendar/events', {
+      title: 'x',
+      start: '2026-05-28T14:00:00Z',
+      end: '2026-05-28T15:00:00Z',
+      description: 'custom',
+      source: 'planner',
+    });
+    expect(vi.mocked(createEvent).mock.calls[0]?.[3]).toMatchObject({ description: 'custom' });
+  });
+
+  it('POST without source keeps a plain uuid and no default description', async () => {
+    vi.mocked(getSettings).mockResolvedValue(SETTINGS);
+    vi.mocked(decrypt).mockResolvedValue('app-pw');
+    vi.mocked(createEvent).mockResolvedValue(undefined);
+
+    const res = await post(events, 'https://proxy/api/calendar/events', {
+      title: 'Focus block',
+      start: '2026-05-28T14:00:00Z',
+      end: '2026-05-28T15:00:00Z',
+    });
+    const body = (await res.json()) as { uid: string };
+    expect(body.uid).not.toMatch(/^hupo-block-/);
+    expect(vi.mocked(createEvent).mock.calls[0]?.[3]).toMatchObject({ description: undefined });
+  });
+
+  it('PATCH rebuilds the event at the uid and returns { ok: true }', async () => {
+    vi.mocked(getSettings).mockResolvedValue(SETTINGS);
+    vi.mocked(decrypt).mockResolvedValue('app-pw');
+    vi.mocked(updateEvent).mockResolvedValue(undefined);
+
+    const res = await req(events, 'https://proxy/api/calendar/events', {
+      method: 'PATCH',
+      body: JSON.stringify({
+        uid: 'hupo-block-abc',
+        title: 'Draft brief',
+        start: '2026-05-28T16:00:00Z',
+        end: '2026-05-28T16:30:00Z',
+      }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true });
+    expect(updateEvent).toHaveBeenCalledWith(
+      SETTINGS.caldav_calendar_url,
+      SETTINGS.caldav_apple_id,
+      'app-pw',
+      {
+        uid: 'hupo-block-abc',
+        title: 'Draft brief',
+        start: '2026-05-28T16:00:00Z',
+        end: '2026-05-28T16:30:00Z',
+        description: undefined,
+      },
+    );
+  });
+
+  it('PATCH returns 400 on a uid with path characters or missing fields', async () => {
+    vi.mocked(getSettings).mockResolvedValue(SETTINGS);
+    const bad = await req(events, 'https://proxy/api/calendar/events', {
+      method: 'PATCH',
+      body: JSON.stringify({
+        uid: '../other',
+        title: 'x',
+        start: '2026-05-28T16:00:00Z',
+        end: '2026-05-28T16:30:00Z',
+      }),
+    });
+    expect(bad.status).toBe(400);
+    const missing = await req(events, 'https://proxy/api/calendar/events', {
+      method: 'PATCH',
+      body: JSON.stringify({ uid: 'hupo-block-abc', title: 'x' }),
+    });
+    expect(missing.status).toBe(400);
+    expect(updateEvent).not.toHaveBeenCalled();
+    expect(getSettings).not.toHaveBeenCalled();
+  });
+
+  it('DELETE removes the event and returns { ok: true }', async () => {
+    vi.mocked(getSettings).mockResolvedValue(SETTINGS);
+    vi.mocked(decrypt).mockResolvedValue('app-pw');
+    vi.mocked(deleteEvent).mockResolvedValue({ missing: false });
+
+    const res = await req(events, 'https://proxy/api/calendar/events?uid=hupo-block-abc', {
+      method: 'DELETE',
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true });
+    expect(deleteEvent).toHaveBeenCalledWith(
+      SETTINGS.caldav_calendar_url,
+      SETTINGS.caldav_apple_id,
+      'app-pw',
+      'hupo-block-abc',
+    );
+  });
+
+  it('DELETE of an already-gone event answers { ok: true, missing: true }', async () => {
+    vi.mocked(getSettings).mockResolvedValue(SETTINGS);
+    vi.mocked(decrypt).mockResolvedValue('app-pw');
+    vi.mocked(deleteEvent).mockResolvedValue({ missing: true });
+
+    const res = await req(events, 'https://proxy/api/calendar/events?uid=hupo-block-abc', {
+      method: 'DELETE',
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, missing: true });
+  });
+
+  it('DELETE returns 400 on a missing or malformed uid', async () => {
+    const none = await req(events, 'https://proxy/api/calendar/events', { method: 'DELETE' });
+    expect(none.status).toBe(400);
+    const bad = await req(events, 'https://proxy/api/calendar/events?uid=a/b', {
+      method: 'DELETE',
+    });
+    expect(bad.status).toBe(400);
+    expect(deleteEvent).not.toHaveBeenCalled();
+  });
+
+  it('PATCH maps an iCloud auth failure like POST does', async () => {
+    vi.mocked(getSettings).mockResolvedValue(SETTINGS);
+    vi.mocked(decrypt).mockResolvedValue('app-pw');
+    vi.mocked(updateEvent).mockRejectedValue(new CalDavError('auth', '401 Unauthorized'));
+    const res = await req(events, 'https://proxy/api/calendar/events', {
+      method: 'PATCH',
+      body: JSON.stringify({
+        uid: 'hupo-block-abc',
+        title: 'x',
+        start: '2026-05-28T16:00:00Z',
+        end: '2026-05-28T16:30:00Z',
+      }),
+    });
+    expect(res.status).toBe(401);
+    expect(updateSettings).toHaveBeenCalledWith('user-1', { caldav_status: 'auth_failed' });
+  });
+
+  it('rejects GET with 405', async () => {
+    const res = await req(events, 'https://proxy/api/calendar/events');
+    expect(res.status).toBe(405);
   });
 });
