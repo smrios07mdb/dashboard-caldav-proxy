@@ -1,14 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const {
-  createDAVClientMock,
+  createAccountMock,
+  propfindMock,
   fetchCalendarObjectsMock,
   createCalendarObjectMock,
   updateCalendarObjectMock,
   deleteCalendarObjectMock,
   getBasicAuthHeadersMock,
 } = vi.hoisted(() => ({
-  createDAVClientMock: vi.fn(),
+  createAccountMock: vi.fn(),
+  propfindMock: vi.fn(),
   fetchCalendarObjectsMock: vi.fn(),
   createCalendarObjectMock: vi.fn(),
   updateCalendarObjectMock: vi.fn(),
@@ -17,7 +19,8 @@ const {
 }));
 
 vi.mock('../api/_lib/tsdav', () => ({
-  createDAVClient: createDAVClientMock,
+  createAccount: createAccountMock,
+  propfind: propfindMock,
   fetchCalendarObjects: fetchCalendarObjectsMock,
   createCalendarObject: createCalendarObjectMock,
   updateCalendarObject: updateCalendarObjectMock,
@@ -36,7 +39,7 @@ import {
   PLANNER_UID_PREFIX,
   updateEvent,
 } from '../api/_lib/caldav';
-import { parseReadCalendars } from '../api/_lib/readSet';
+import { normalizeColor, parseReadCalendars } from '../api/_lib/readSet';
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -75,39 +78,123 @@ describe('classifyError', () => {
 
 // ── discover ─────────────────────────────────────────────────────────────────
 describe('discover', () => {
-  it('returns VEVENT-capable calendars as {url, name} and authenticates Basic against iCloud', async () => {
-    createDAVClientMock.mockResolvedValue({
-      fetchCalendars: vi.fn().mockResolvedValue([
-        {
-          url: 'https://caldav.icloud.com/1/calendars/home/',
-          displayName: 'Home',
-          components: ['VEVENT'],
-        },
-        {
-          url: 'https://caldav.icloud.com/1/calendars/tasks/',
-          displayName: 'Reminders',
-          components: ['VTODO'],
-        },
-      ]),
+  const ROOT = 'https://caldav.icloud.com/';
+  const HOME_URL = 'https://caldav.icloud.com/1/calendars/';
+  const resp = (
+    href: string,
+    props: Record<string, unknown>,
+  ): {
+    href: string;
+    ok: boolean;
+    status: number;
+    statusText: string;
+    props: Record<string, unknown>;
+  } => ({
+    href,
+    ok: true,
+    status: 207,
+    statusText: 'Multi-Status',
+    props,
+  });
+  const comps = (...names: string[]) => ({
+    comp: names.map((name) => ({ _attributes: { name } })),
+  });
+
+  beforeEach(() => {
+    createAccountMock.mockResolvedValue({
+      serverUrl: ROOT,
+      rootUrl: ROOT,
+      principalUrl: 'https://caldav.icloud.com/1/principal/',
+      homeUrl: HOME_URL,
+      accountType: 'caldav',
     });
+  });
 
-    const out = await discover('me@icloud.com', 'app-pw');
-
-    expect(out.calendars).toEqual([
-      { url: 'https://caldav.icloud.com/1/calendars/home/', name: 'Home' },
-    ]);
-    expect(createDAVClientMock).toHaveBeenCalledWith(
+  it('runs a Depth-1 PROPFIND on the calendar home with Basic auth against iCloud', async () => {
+    propfindMock.mockResolvedValue([]);
+    await discover('me@icloud.com', 'app-pw');
+    expect(createAccountMock).toHaveBeenCalledWith(
       expect.objectContaining({
-        serverUrl: 'https://caldav.icloud.com/',
-        credentials: { username: 'me@icloud.com', password: 'app-pw' },
-        authMethod: 'Basic',
-        defaultAccountType: 'caldav',
+        account: expect.objectContaining({
+          serverUrl: ROOT,
+          credentials: { username: 'me@icloud.com', password: 'app-pw' },
+          accountType: 'caldav',
+        }),
+        headers: { authorization: 'Basic xxx' },
+      }),
+    );
+    expect(propfindMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        url: HOME_URL,
+        depth: '1',
+        headers: { authorization: 'Basic xxx' },
+        props: expect.objectContaining({
+          'd:resourcetype': {},
+          'ca:calendar-color': {},
+        }),
       }),
     );
   });
 
+  it('keeps <calendar/> AND <cs:subscribed/> collections (chunk 51b), with name and #rrggbb color', async () => {
+    propfindMock.mockResolvedValue([
+      // The home collection itself: no calendar resourcetype → skipped.
+      resp('/1/calendars/', { displayname: 'Sergio', resourcetype: { collection: '' } }),
+      resp('/1/calendars/home/', {
+        displayname: 'Home',
+        resourcetype: { collection: '', calendar: '' },
+        calendarColor: '#FF2968FF',
+        supportedCalendarComponentSet: comps('VEVENT'),
+      }),
+      // A subscription (US Holidays): tsdav's fetchCalendars drops this one.
+      resp('/1/calendars/holidays/', {
+        displayname: 'US Holidays',
+        resourcetype: { collection: '', subscribed: '' },
+        calendarColor: { _cdata: '#63DA38FF' },
+        supportedCalendarComponentSet: comps('VEVENT'),
+      }),
+      // Reminders (VTODO only) → excluded.
+      resp('/1/calendars/tasks/', {
+        displayname: 'Reminders',
+        resourcetype: { collection: '', calendar: '' },
+        supportedCalendarComponentSet: comps('VTODO'),
+      }),
+      // Scheduling inbox / notifications carry neither resourcetype → excluded.
+      resp('/1/calendars/inbox/', { resourcetype: { collection: '', scheduleInbox: '' } }),
+      resp('/1/calendars/notification/', { resourcetype: { collection: '', notification: '' } }),
+    ]);
+
+    const out = await discover('me@icloud.com', 'app-pw');
+
+    expect(out.calendars).toEqual([
+      { url: 'https://caldav.icloud.com/1/calendars/home/', name: 'Home', color: '#ff2968' },
+      {
+        url: 'https://caldav.icloud.com/1/calendars/holidays/',
+        name: 'US Holidays',
+        color: '#63da38',
+        subscribed: true,
+      },
+    ]);
+  });
+
+  it('a calendar with no component set is kept; no displayname → url; bad color → no color', async () => {
+    propfindMock.mockResolvedValue([
+      resp('/1/calendars/x/', {
+        resourcetype: { collection: '', calendar: '' },
+        calendarColor: 'red',
+      }),
+    ]);
+    const out = await discover('me@icloud.com', 'app-pw');
+    expect(out.calendars).toEqual([
+      {
+        url: 'https://caldav.icloud.com/1/calendars/x/',
+        name: 'https://caldav.icloud.com/1/calendars/x/',
+      },
+    ]);
+  });
+
   it('maps a 401 during login to CalDavError(kind="auth")', async () => {
-    createDAVClientMock.mockRejectedValue(
+    createAccountMock.mockRejectedValue(
       new Error('Invalid credentials: PROPFIND returned 401 Unauthorized'),
     );
     await expect(discover('me@icloud.com', 'bad')).rejects.toMatchObject({ kind: 'auth' });
@@ -394,6 +481,25 @@ describe('getBusy (multi-calendar read, chunk 51)', () => {
     expect(fetchCalendarObjectsMock).toHaveBeenCalledTimes(3);
   });
 
+  it('tags every interval with its calendar’s color when the read set has one (chunk 51b)', async () => {
+    mockCalendars({ [HOME]: [evt('h1', 14)], [WORK]: [evt('w1', 9)] });
+    const out = await getBusy(
+      [
+        { url: HOME, name: 'Home', enabled: true, color: '#ff2968' },
+        { url: WORK, name: 'Work', enabled: true },
+      ],
+      HOME,
+      'me@icloud.com',
+      'pw',
+      ...WINDOW,
+    );
+    expect(out.intervals.map((i) => [i.calendar, i.color])).toEqual([
+      ['Work', undefined],
+      ['Home', '#ff2968'],
+    ]);
+    expect('color' in out.intervals[0]!).toBe(false);
+  });
+
   it('a disabled calendar contributes nothing and is not fetched', async () => {
     mockCalendars({ [HOME]: [evt('h1', 14)], [WORK]: [evt('w1', 9)] });
     const out = await getBusy(
@@ -636,6 +742,20 @@ describe('parseReadCalendars', () => {
     ).toEqual([{ url: HOME, name: 'Home', enabled: true }]);
   });
 
+  it('keeps a valid #rrggbb color (lower-cased) and drops anything else (chunk 51b)', () => {
+    expect(
+      parseReadCalendars([
+        { url: HOME, name: 'Home', enabled: true, color: '#FF2968' },
+        { url: WORK, name: 'Work', enabled: true, color: 'red' },
+        { url: FAMILY, name: 'Family', enabled: true, color: '#ff2968ff' },
+      ]),
+    ).toEqual([
+      { url: HOME, name: 'Home', enabled: true, color: '#ff2968' },
+      { url: WORK, name: 'Work', enabled: true },
+      { url: FAMILY, name: 'Family', enabled: true },
+    ]);
+  });
+
   it('an empty array is a valid (empty) read set, not null', () => {
     expect(parseReadCalendars([])).toEqual([]);
   });
@@ -784,5 +904,17 @@ describe('deleteEvent', () => {
     await expect(deleteEvent(cal, 'me@icloud.com', 'pw', 'hupo-block-abc')).rejects.toMatchObject({
       kind: 'network',
     });
+  });
+});
+
+describe('normalizeColor (chunk 51b)', () => {
+  it('accepts #rrggbb and #rrggbbaa (alpha dropped), lower-cases, rejects the rest', () => {
+    expect(normalizeColor('#FF2968FF')).toBe('#ff2968');
+    expect(normalizeColor('#ff2968')).toBe('#ff2968');
+    expect(normalizeColor(' #63DA38 ')).toBe('#63da38');
+    expect(normalizeColor('#fff')).toBeUndefined();
+    expect(normalizeColor('red')).toBeUndefined();
+    expect(normalizeColor(undefined)).toBeUndefined();
+    expect(normalizeColor(42)).toBeUndefined();
   });
 });

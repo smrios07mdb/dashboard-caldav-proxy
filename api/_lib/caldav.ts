@@ -2,16 +2,17 @@
 // that file for why). Importing from the wrapper rather than 'tsdav' directly
 // also makes vitest's vi.mock hook in normally.
 import {
+  createAccount,
   createCalendarObject,
-  createDAVClient,
   deleteCalendarObject,
   fetchCalendarObjects,
   getBasicAuthHeaders,
+  propfind,
   updateCalendarObject,
-  type DAVCalendar,
+  type DAVResponse,
 } from './tsdav.js';
 import { expandCalendarBusy } from './busyExpand.js';
-import type { ReadCalendar } from './readSet.js';
+import { normalizeColor, type ReadCalendar } from './readSet.js';
 
 const ICLOUD_CALDAV_URL = 'https://caldav.icloud.com/';
 
@@ -88,28 +89,108 @@ export function classifyError(err: unknown): CalDavError {
 export interface DiscoveredCalendar {
   url: string;
   name: string;
+  /** `#rrggbb` from iCloud's `calendar-color`, when present (chunk 51b). */
+  color?: string;
+  /** True for a subscription (holidays, any webcal feed) — read-only upstream. */
+  subscribed?: boolean;
 }
 
+/**
+ * List the account's event calendars (chunk 51b rewrite). tsdav's own
+ * `fetchCalendars` keeps only collections whose `resourcetype` carries
+ * `<calendar/>`, and iCloud reports every *subscribed* calendar (US
+ * Holidays, any webcal feed) as `<collection/><cs:subscribed/>` instead —
+ * so chunk 51's discovery silently dropped exactly the calendars ARCH §7
+ * promised ("subscribed and holiday calendars included"). This runs the
+ * same Depth-1 PROPFIND on the calendar home and keeps both kinds, still
+ * excluding VTODO-only collections (Reminders) and the scheduling inbox /
+ * outbox / notification collections, which carry neither resourcetype.
+ * Birthdays and Siri Suggestions never appear on CalDAV at all.
+ */
 export async function discover(
   appleId: string,
   password: string,
 ): Promise<{ calendars: DiscoveredCalendar[] }> {
   try {
-    const client = await createDAVClient({
-      serverUrl: ICLOUD_CALDAV_URL,
-      credentials: { username: appleId, password },
-      authMethod: 'Basic',
-      defaultAccountType: 'caldav',
+    const headers = getBasicAuthHeaders({ username: appleId, password });
+    const account = await createAccount({
+      account: {
+        serverUrl: ICLOUD_CALDAV_URL,
+        credentials: { username: appleId, password },
+        accountType: 'caldav',
+      },
+      headers,
     });
-    const calendars = await client.fetchCalendars();
-    return {
-      calendars: calendars
-        .filter((c) => !c.components || c.components.includes('VEVENT'))
-        .map((c) => ({ url: c.url, name: calendarName(c) })),
-    };
+    if (!account.homeUrl) throw new Error('cannot find calendar home');
+    const responses = await propfind({
+      url: account.homeUrl,
+      props: {
+        'd:displayname': {},
+        'd:resourcetype': {},
+        'ca:calendar-color': {},
+        'c:supported-calendar-component-set': {},
+      },
+      depth: '1',
+      headers,
+    });
+    const rootUrl = account.rootUrl ?? ICLOUD_CALDAV_URL;
+    const calendars: DiscoveredCalendar[] = [];
+    for (const r of responses) {
+      const cal = discoveredFromResponse(r, rootUrl);
+      if (cal) calendars.push(cal);
+    }
+    return { calendars };
   } catch (err) {
     throw classifyError(err);
   }
+}
+
+/** One PROPFIND response → a calendar, or `null` when it isn't an event calendar. */
+function discoveredFromResponse(r: DAVResponse, rootUrl: string): DiscoveredCalendar | null {
+  const props = (r.props ?? {}) as Record<string, unknown>;
+  const types = Object.keys(
+    typeof props.resourcetype === 'object' && props.resourcetype !== null
+      ? (props.resourcetype as Record<string, unknown>)
+      : {},
+  );
+  const isCalendar = types.includes('calendar');
+  const isSubscribed = types.includes('subscribed');
+  if (!isCalendar && !isSubscribed) return null;
+  const components = componentNames(props.supportedCalendarComponentSet);
+  if (components.length > 0 && !components.includes('VEVENT')) return null;
+  if (!r.href) return null;
+  const url = new URL(r.href, rootUrl).href;
+  const dn = props.displayname;
+  const rawName =
+    typeof dn === 'string'
+      ? dn
+      : typeof dn === 'object' &&
+          dn !== null &&
+          typeof (dn as { _cdata?: unknown })._cdata === 'string'
+        ? (dn as { _cdata: string })._cdata
+        : '';
+  const out: DiscoveredCalendar = { url, name: rawName.trim() || url };
+  const color = normalizeColor(
+    typeof props.calendarColor === 'object' && props.calendarColor !== null
+      ? (props.calendarColor as { _cdata?: unknown })._cdata
+      : props.calendarColor,
+  );
+  if (color) out.color = color;
+  if (isSubscribed) out.subscribed = true;
+  return out;
+}
+
+/** `supported-calendar-component-set` → ['VEVENT', …] (tsdav's parsed shape). */
+function componentNames(set: unknown): string[] {
+  if (typeof set !== 'object' || set === null) return [];
+  const comp = (set as { comp?: unknown }).comp;
+  const list = Array.isArray(comp) ? comp : comp ? [comp] : [];
+  const names: string[] = [];
+  for (const c of list) {
+    const name = (c as { _attributes?: { name?: unknown } })?._attributes?.name;
+    if (typeof name === 'string') names.push(name);
+  }
+  return names;
 }
 
 export interface BusyInterval {
@@ -119,6 +200,8 @@ export interface BusyInterval {
   /** Display name of the iCloud calendar the interval came from (chunk 51).
    *  Absent on the legacy single-calendar path (null read set). */
   calendar?: string;
+  /** That calendar's `#rrggbb` from the read set (chunk 51b), when known. */
+  color?: string;
 }
 
 /** A planner-block mirror found on the calendar (first expanded instance). */
@@ -236,7 +319,12 @@ export async function getBusy(
   }
   if (writeTargetUrl && !seen.has(writeTargetUrl)) {
     const known = calendars.find((c) => c.url === writeTargetUrl);
-    fetchSet.push({ url: writeTargetUrl, name: known?.name ?? '', enabled: false });
+    fetchSet.push({
+      url: writeTargetUrl,
+      name: known?.name ?? '',
+      enabled: false,
+      ...(known?.color ? { color: known.color } : {}),
+    });
   }
 
   const settled = await mapPool(fetchSet, BUSY_CONCURRENCY, (c) =>
@@ -254,7 +342,11 @@ export async function getBusy(
       plannerEvents.push(...r.value.plannerEvents);
       if (c.enabled) {
         for (const iv of r.value.intervals) {
-          intervals.push(c.name ? { ...iv, calendar: c.name } : iv);
+          intervals.push({
+            ...iv,
+            ...(c.name ? { calendar: c.name } : {}),
+            ...(c.color ? { color: c.color } : {}),
+          });
         }
       }
     } else {
@@ -402,11 +494,6 @@ export async function deleteEvent(
  */
 function objectUrl(calendarUrl: string, uid: string): string {
   return new URL(`${uid}.ics`, calendarUrl).href;
-}
-
-function calendarName(c: DAVCalendar): string {
-  const dn = c.displayName;
-  return typeof dn === 'string' && dn.trim() ? dn : c.url;
 }
 
 function buildVEvent(e: NewEvent): string {

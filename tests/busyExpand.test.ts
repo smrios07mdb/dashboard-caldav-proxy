@@ -54,7 +54,7 @@ const weeklyFridayEt = (...extra: string[]): string =>
 // ── expandCalendarBusy ───────────────────────────────────────────────────────
 
 describe('expandCalendarBusy', () => {
-  it('expands a TZID master + weekly RRULE to this week\'s occurrence, not the series DTSTART', () => {
+  it("expands a TZID master + weekly RRULE to this week's occurrence, not the series DTSTART", () => {
     const busy = expandCalendarBusy(weeklyFridayEt(), WEEK.from, WEEK.to);
     expect(busy).toEqual([
       {

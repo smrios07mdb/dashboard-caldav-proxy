@@ -33,11 +33,7 @@ export interface ExpandedBusyInterval {
  * Parse failures propagate as raw errors — callers decide whether one bad
  * payload fails the response (ICS feed) or is skipped (per CalDAV object).
  */
-export function expandCalendarBusy(
-  raw: string,
-  from: string,
-  to: string,
-): ExpandedBusyInterval[] {
+export function expandCalendarBusy(raw: string, from: string, to: string): ExpandedBusyInterval[] {
   const fromMs = Date.parse(from);
   const toMs = Date.parse(to);
   if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || toMs <= fromMs) return [];

@@ -18,6 +18,8 @@ interface TaggedInterval {
   title?: string;
   /** iCloud only (chunk 51): display name of the calendar it came from. */
   calendar?: string;
+  /** iCloud only (chunk 51b): that calendar's `#rrggbb`, when the read set knows it. */
+  color?: string;
 }
 
 export default {
