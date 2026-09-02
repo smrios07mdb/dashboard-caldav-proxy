@@ -43,6 +43,7 @@ import health from '../api/health';
 import testCredentials from '../api/calendar/test-credentials';
 import saveCredentials from '../api/calendar/save-credentials';
 import busy from '../api/calendar/busy';
+import calendars from '../api/calendar/calendars';
 import events from '../api/calendar/events';
 import outlook from '../api/calendar/outlook';
 
@@ -52,6 +53,7 @@ const SETTINGS = {
   caldav_app_password_encrypted: '\\x6162', // bytea hex for "ab"
   caldav_calendar_url: 'https://caldav.icloud.com/1/calendars/home/',
   caldav_status: 'ok',
+  caldav_read_calendars: null,
   outlook_ics_url_encrypted: null,
   outlook_feed_name: null,
   outlook_status: 'unconfigured',
@@ -211,7 +213,21 @@ describe('save-credentials', () => {
       caldav_app_password_encrypted: '\\x010203',
       caldav_calendar_url: 'https://cal/home/',
       caldav_status: 'ok',
+      caldav_read_calendars: null,
     });
+  });
+
+  it('resets the read set to null on every save (chunk 51 — the app re-initializes it)', async () => {
+    vi.mocked(encrypt).mockResolvedValue(Buffer.from([0x01]));
+    await post(saveCredentials, 'https://proxy/api/calendar/save-credentials', {
+      apple_id: 'me@icloud.com',
+      app_password: 'pw',
+      calendar_url: 'https://cal/home/',
+    });
+    expect(updateSettings).toHaveBeenCalledWith(
+      'user-1',
+      expect.objectContaining({ caldav_read_calendars: null }),
+    );
   });
 
   it('returns 400 on an invalid body', async () => {
@@ -228,7 +244,11 @@ interface BusyBody {
   busy: Array<Record<string, unknown>>;
   plannerEvents: Array<{ uid: string; start: string; end: string }>;
   sources: {
-    icloud: { configured: boolean; ok: boolean };
+    icloud: {
+      configured: boolean;
+      ok: boolean;
+      calendars: Array<{ url: string; name: string; ok: boolean }>;
+    };
     outlook: {
       configured: boolean;
       status: string;
@@ -251,6 +271,7 @@ describe('busy', () => {
         { start: '2026-05-28T14:00:00.000Z', end: '2026-05-28T15:00:00.000Z', title: 'Standup' },
       ],
       plannerEvents: [],
+      calendars: [{ url: SETTINGS.caldav_calendar_url, name: '', ok: true }],
     });
 
     const res = await req(busy, BUSY_URL);
@@ -267,11 +288,18 @@ describe('busy', () => {
       ],
       plannerEvents: [],
       sources: {
-        icloud: { configured: true, ok: true },
+        icloud: {
+          configured: true,
+          ok: true,
+          calendars: [{ url: SETTINGS.caldav_calendar_url, name: '', ok: true }],
+        },
         outlook: { configured: false, status: 'unconfigured', fetchedAt: null, feedName: null },
       },
     });
+    // Chunk 51: a null read set is the legacy single-calendar read — the
+    // write target alone, enabled, unnamed.
     expect(getBusy).toHaveBeenCalledWith(
+      [{ url: SETTINGS.caldav_calendar_url, name: '', enabled: true }],
       SETTINGS.caldav_calendar_url,
       SETTINGS.caldav_apple_id,
       'app-pw',
@@ -291,6 +319,7 @@ describe('busy', () => {
       plannerEvents: [
         { uid: 'hupo-block-1', start: '2026-05-28T09:00:00.000Z', end: '2026-05-28T09:30:00.000Z' },
       ],
+      calendars: [{ url: SETTINGS.caldav_calendar_url, name: '', ok: true }],
     });
 
     const res = await req(busy, BUSY_URL);
@@ -363,7 +392,7 @@ describe('busy', () => {
         source: 'outlook',
       },
     ]);
-    expect(body.sources.icloud).toEqual({ configured: false, ok: false });
+    expect(body.sources.icloud).toEqual({ configured: false, ok: false, calendars: [] });
     expect(body.sources.outlook).toMatchObject({
       configured: true,
       status: 'ok',
@@ -396,6 +425,7 @@ describe('busy', () => {
         { start: '2026-05-28T14:00:00.000Z', end: '2026-05-28T15:00:00.000Z', title: 'Apple' },
       ],
       plannerEvents: [],
+      calendars: [{ url: SETTINGS.caldav_calendar_url, name: '', ok: true }],
     });
     vi.mocked(fetchIcsFeed).mockResolvedValue({
       raw: 'BEGIN:VCALENDAR',
@@ -432,7 +462,11 @@ describe('busy', () => {
     vi.mocked(decrypt)
       .mockResolvedValueOnce('app-pw')
       .mockResolvedValueOnce('https://feed.example/cal.ics');
-    vi.mocked(getBusy).mockResolvedValue({ intervals: [], plannerEvents: [] });
+    vi.mocked(getBusy).mockResolvedValue({
+      intervals: [],
+      plannerEvents: [],
+      calendars: [{ url: SETTINGS.caldav_calendar_url, name: '', ok: true }],
+    });
     vi.mocked(fetchIcsFeed).mockRejectedValue(new IcsError('unreachable', 'HTTP 503'));
 
     const res = await req(busy, BUSY_URL);
@@ -496,7 +530,7 @@ describe('busy', () => {
         source: 'outlook',
       },
     ]);
-    expect(body.sources.icloud).toEqual({ configured: true, ok: false });
+    expect(body.sources.icloud).toEqual({ configured: true, ok: false, calendars: [] });
     // The auth side effect still fires even though the response is 200.
     expect(updateSettings).toHaveBeenCalledWith('user-1', { caldav_status: 'auth_failed' });
   });
@@ -516,6 +550,173 @@ describe('busy', () => {
     vi.mocked(getSettings).mockResolvedValue(SETTINGS);
     const res = await req(busy, 'https://proxy/api/calendar/busy?from=2026-05-28T00:00:00Z');
     expect(res.status).toBe(400);
+  });
+});
+
+describe('busy — read set (chunk 51)', () => {
+  const BUSY_URL =
+    'https://proxy/api/calendar/busy?from=2026-05-28T00:00:00Z&to=2026-05-29T00:00:00Z';
+  const HOME = SETTINGS.caldav_calendar_url;
+  const WORK = 'https://caldav.icloud.com/1/calendars/work/';
+  const READ_SET = [
+    { url: HOME, name: 'Home', enabled: true },
+    { url: WORK, name: 'Work', enabled: false },
+  ];
+
+  it('passes the parsed read set + write target to getBusy and reports per-calendar health', async () => {
+    vi.mocked(getSettings).mockResolvedValue({ ...SETTINGS, caldav_read_calendars: READ_SET });
+    vi.mocked(decrypt).mockResolvedValue('app-pw');
+    vi.mocked(getBusy).mockResolvedValue({
+      intervals: [
+        {
+          start: '2026-05-28T14:00:00.000Z',
+          end: '2026-05-28T15:00:00.000Z',
+          title: 'Dentist',
+          calendar: 'Home',
+        },
+      ],
+      plannerEvents: [],
+      calendars: [
+        { url: HOME, name: 'Home', ok: true },
+        { url: WORK, name: 'Work', ok: false, kind: 'other' },
+      ],
+    });
+
+    const res = await req(busy, BUSY_URL);
+    expect(res.status).toBe(200);
+    const body = await busyBody(res);
+    expect(getBusy).toHaveBeenCalledWith(
+      READ_SET,
+      HOME,
+      SETTINGS.caldav_apple_id,
+      'app-pw',
+      '2026-05-28T00:00:00Z',
+      '2026-05-29T00:00:00Z',
+    );
+    expect(body.busy).toEqual([
+      {
+        start: '2026-05-28T14:00:00.000Z',
+        end: '2026-05-28T15:00:00.000Z',
+        title: 'Dentist',
+        calendar: 'Home',
+        source: 'icloud',
+      },
+    ]);
+    // `kind` is internal — the response carries { url, name, ok } only.
+    expect(body.sources.icloud).toEqual({
+      configured: true,
+      ok: true,
+      calendars: [
+        { url: HOME, name: 'Home', ok: true },
+        { url: WORK, name: 'Work', ok: false },
+      ],
+    });
+    expect(updateSettings).not.toHaveBeenCalled();
+  });
+
+  it('sources.icloud.ok is false when no calendar answered but the response still resolves', async () => {
+    vi.mocked(getSettings).mockResolvedValue({ ...SETTINGS, caldav_read_calendars: READ_SET });
+    vi.mocked(decrypt).mockResolvedValue('app-pw');
+    // getBusy only throws when EVERY calendar failed; a resolved result with
+    // zero ok entries can't happen today, but the endpoint derives `ok` from
+    // the outcomes rather than assuming success.
+    vi.mocked(getBusy).mockResolvedValue({
+      intervals: [],
+      plannerEvents: [],
+      calendars: [{ url: HOME, name: 'Home', ok: false, kind: 'network' }],
+    });
+    const res = await req(busy, BUSY_URL);
+    expect(res.status).toBe(200);
+    const body = await busyBody(res);
+    expect(body.sources.icloud.ok).toBe(false);
+  });
+
+  it('a malformed read set jsonb falls back to the legacy single-calendar read', async () => {
+    vi.mocked(getSettings).mockResolvedValue({
+      ...SETTINGS,
+      caldav_read_calendars: { not: 'an array' },
+    });
+    vi.mocked(decrypt).mockResolvedValue('app-pw');
+    vi.mocked(getBusy).mockResolvedValue({
+      intervals: [],
+      plannerEvents: [],
+      calendars: [{ url: HOME, name: '', ok: true }],
+    });
+    await req(busy, BUSY_URL);
+    expect(getBusy).toHaveBeenCalledWith(
+      [{ url: HOME, name: '', enabled: true }],
+      HOME,
+      SETTINGS.caldav_apple_id,
+      'app-pw',
+      '2026-05-28T00:00:00Z',
+      '2026-05-29T00:00:00Z',
+    );
+  });
+
+  it('an all-auth failure across the read set still flips caldav_status and 401s (iCloud only)', async () => {
+    vi.mocked(getSettings).mockResolvedValue({ ...SETTINGS, caldav_read_calendars: READ_SET });
+    vi.mocked(decrypt).mockResolvedValue('app-pw');
+    vi.mocked(getBusy).mockRejectedValue(new CalDavError('auth', '401 Unauthorized'));
+    const res = await req(busy, BUSY_URL);
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ ok: false, error: 'auth_failed' });
+    expect(updateSettings).toHaveBeenCalledWith('user-1', { caldav_status: 'auth_failed' });
+  });
+});
+
+describe('calendars (chunk 51)', () => {
+  const URL_ = 'https://proxy/api/calendar/calendars';
+
+  it('discovers with the STORED credentials and echoes the write target', async () => {
+    vi.mocked(getSettings).mockResolvedValue(SETTINGS);
+    vi.mocked(decrypt).mockResolvedValue('app-pw');
+    vi.mocked(discover).mockResolvedValue({
+      calendars: [
+        { url: SETTINGS.caldav_calendar_url, name: 'Home' },
+        { url: 'https://caldav.icloud.com/1/calendars/work/', name: 'Work' },
+      ],
+    });
+    const res = await req(calendars, URL_);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      ok: true,
+      calendars: [
+        { url: SETTINGS.caldav_calendar_url, name: 'Home' },
+        { url: 'https://caldav.icloud.com/1/calendars/work/', name: 'Work' },
+      ],
+      writeTargetUrl: SETTINGS.caldav_calendar_url,
+    });
+    expect(decrypt).toHaveBeenCalledWith(Buffer.from('ab'));
+    expect(discover).toHaveBeenCalledWith('me@icloud.com', 'app-pw');
+  });
+
+  it('returns 412 no_credentials when iCloud is not configured', async () => {
+    vi.mocked(getSettings).mockResolvedValue(SETTINGS_OUTLOOK_ONLY);
+    const res = await req(calendars, URL_);
+    expect(res.status).toBe(412);
+    expect(await res.json()).toEqual({ ok: false, error: 'no_credentials' });
+    expect(discover).not.toHaveBeenCalled();
+  });
+
+  it('flips caldav_status and returns 401 auth_failed on an iCloud auth failure', async () => {
+    vi.mocked(getSettings).mockResolvedValue(SETTINGS);
+    vi.mocked(decrypt).mockResolvedValue('app-pw');
+    vi.mocked(discover).mockRejectedValue(new CalDavError('auth', '401 Unauthorized'));
+    const res = await req(calendars, URL_);
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ ok: false, error: 'auth_failed' });
+    expect(updateSettings).toHaveBeenCalledWith('user-1', { caldav_status: 'auth_failed' });
+  });
+
+  it('returns 502 on a network/other failure and 405 on POST', async () => {
+    vi.mocked(getSettings).mockResolvedValue(SETTINGS);
+    vi.mocked(decrypt).mockResolvedValue('app-pw');
+    vi.mocked(discover).mockRejectedValue(new CalDavError('network', 'fetch failed'));
+    const res = await req(calendars, URL_);
+    expect(res.status).toBe(502);
+    expect(await res.json()).toEqual({ ok: false, error: 'network' });
+    const posted = await post(calendars, URL_, {});
+    expect(posted.status).toBe(405);
   });
 });
 

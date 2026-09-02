@@ -26,16 +26,17 @@ canonical design.
 All `/api/calendar/*` routes require a valid Supabase JWT and honor CORS for the
 origins in `ALLOWED_ORIGINS`.
 
-| Method & path                         | Body / query                               | Success                                                              | Notable failures                                                         |
-| ------------------------------------- | ------------------------------------------ | -------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| `GET /api/health`                     | —                                          | `{ ok: true }`                                                       | —                                                                        |
-| `POST /api/calendar/test-credentials` | `{ apple_id, app_password }`               | `{ ok: true, calendars: [{ url, name }] }`                           | `401 { error: "auth" }`, `400`                                           |
-| `POST /api/calendar/save-credentials` | `{ apple_id, app_password, calendar_url }` | `{ ok: true }`                                                       | `400`                                                                    |
-| `GET /api/calendar/busy`              | `?from=<ISO>&to=<ISO>`                     | `{ ok: true, busy: [{ start, end, source, title? }], plannerEvents, sources }` | `412 { error: "no_credentials" }`, `401 { error: "auth_failed" }`        |
-| `POST /api/calendar/events`           | `{ title, start, end, description?, source?: 'planner' }` | `{ ok: true, uid }`                                   | `412`, `401 { error: "auth_failed" }`                                    |
-| `PATCH /api/calendar/events`          | `{ uid, title, start, end, description? }` | `{ ok: true }`                                                       | `400`, `412`, `401 { error: "auth_failed" }`                             |
-| `DELETE /api/calendar/events?uid=…`   | —                                          | `{ ok: true }` / `{ ok: true, missing: true }` (already gone)        | `400`, `412`, `401 { error: "auth_failed" }`                             |
-| `POST /api/calendar/outlook`          | `{ icsUrl: string \| null }`               | `{ ok: true, feedName, eventCount }` / `{ ok: true, cleared: true }` | `422 { error: "invalid_url" \| "unreachable" \| "invalid_feed" }`, `400` |
+| Method & path                         | Body / query                                              | Success                                                                                   | Notable failures                                                         |
+| ------------------------------------- | --------------------------------------------------------- | ----------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `GET /api/health`                     | —                                                         | `{ ok: true }`                                                                            | —                                                                        |
+| `POST /api/calendar/test-credentials` | `{ apple_id, app_password }`                              | `{ ok: true, calendars: [{ url, name }] }`                                                | `401 { error: "auth" }`, `400`                                           |
+| `POST /api/calendar/save-credentials` | `{ apple_id, app_password, calendar_url }`                | `{ ok: true }`                                                                            | `400`                                                                    |
+| `GET /api/calendar/calendars`         | —                                                         | `{ ok: true, calendars: [{ url, name }], writeTargetUrl }` (stored creds)                 | `412 { error: "no_credentials" }`, `401 { error: "auth_failed" }`        |
+| `GET /api/calendar/busy`              | `?from=<ISO>&to=<ISO>`                                    | `{ ok: true, busy: [{ start, end, source, title?, calendar? }], plannerEvents, sources }` | `412 { error: "no_credentials" }`, `401 { error: "auth_failed" }`        |
+| `POST /api/calendar/events`           | `{ title, start, end, description?, source?: 'planner' }` | `{ ok: true, uid }`                                                                       | `412`, `401 { error: "auth_failed" }`                                    |
+| `PATCH /api/calendar/events`          | `{ uid, title, start, end, description? }`                | `{ ok: true }`                                                                            | `400`, `412`, `401 { error: "auth_failed" }`                             |
+| `DELETE /api/calendar/events?uid=…`   | —                                                         | `{ ok: true }` / `{ ok: true, missing: true }` (already gone)                             | `400`, `412`, `401 { error: "auth_failed" }`                             |
+| `POST /api/calendar/outlook`          | `{ icsUrl: string \| null }`                              | `{ ok: true, feedName, eventCount }` / `{ ok: true, cleared: true }`                      | `422 { error: "invalid_url" \| "unreachable" \| "invalid_feed" }`, `400` |
 
 Missing/invalid JWT → `401 { ok: false, error: "unauthorized" }`. Upstream
 iCloud network/other failures → `502 { ok: false, error: "network" | "other" }`.
@@ -45,10 +46,15 @@ one configured source is enough. Its `sources` key reports per-source health:
 
 ```
 sources: {
-  icloud:  { configured, ok },
+  icloud:  { configured, ok, calendars: [{ url, name, ok }] },
   outlook: { configured, status: 'ok' | 'stale' | 'unconfigured', fetchedAt, feedName }
 }
 ```
+
+`sources.icloud.ok` is true when at least one iCloud calendar answered;
+`calendars` lists every calendar the request fetched with its own outcome.
+iCloud `busy` entries carry `calendar: <display name>` (absent on the legacy
+single-calendar path — see "Read set vs write target" below).
 
 ## Planner block mirror (chunk 39)
 
@@ -74,6 +80,33 @@ iCloud calendar (opt-in, `settings.planner_writeout`). The proxy's part:
   (the app already counts the block as scheduled, and uses this list to
   reconcile orphans and time drift). Outlook output is untouched;
   `plannerEvents` is `[]` when iCloud isn't configured.
+
+## Read set vs write target (chunk 51)
+
+The proxy reads **all** of the account's event calendars but writes to one.
+
+- **Write target** — `settings.caldav_calendar_url`, chosen in the app's
+  Settings at connect time. Every planner mirror (`POST/PATCH/DELETE
+/api/calendar/events`) goes here. Unchanged by chunk 51.
+- **Read set** — `settings.caldav_read_calendars` (jsonb,
+  `[{ url, name, enabled }]`, parsed by `api/_lib/readSet.ts`). `busy` fans
+  out across the **enabled** calendars in parallel (`Promise.allSettled`, at
+  most 6 in flight) and merges the intervals, each tagged `calendar: <name>`.
+  One failing calendar never fails the response — it is reported
+  `ok: false` in `sources.icloud.calendars`; the request throws only when
+  every calendar failed (all-auth → `401 auth_failed` + `caldav_status`
+  flip, exactly as before).
+- **The write target is always fetched**, even when it is disabled or absent
+  from the read set: planner mirrors live there and `plannerEvents` must
+  keep reporting them. A disabled write target contributes `plannerEvents`
+  but no busy intervals. The `hupo-block-` exclusion runs per calendar, so a
+  mirror never becomes busy on any calendar.
+- **`null` read set = legacy.** Every pre-chunk-51 row is `null`, and
+  `save-credentials` resets the column to `null` on every save; the proxy
+  then reads the write target alone (unnamed — no `calendar` field). The app
+  initializes the set to all-discovered / all-enabled on its first Planner
+  mount via `GET /api/calendar/calendars`, which runs discovery with the
+  **stored** credentials (no password in the request).
 
 **Busy expansion** — both sources expand through one shared path
 (`api/_lib/busyExpand.ts`, built on `node-ical`): VTIMEZONE/TZID → UTC

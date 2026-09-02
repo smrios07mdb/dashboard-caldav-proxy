@@ -22,8 +22,11 @@ export interface CalDavSettings {
   caldav_apple_id: string | null;
   // `bytea` column. PostgREST surfaces it as a `\x`-prefixed hex string.
   caldav_app_password_encrypted: string | null;
-  caldav_calendar_url: string | null;
+  caldav_calendar_url: string | null; // the single WRITE target (chunk 39 mirrors)
   caldav_status: string | null;
+  // jsonb READ set, [{ url, name, enabled }] — see _lib/readSet.ts. null =
+  // not initialized → busy falls back to reading the write target only.
+  caldav_read_calendars: unknown;
   // Outlook published-calendar ICS feed (read-only source).
   outlook_ics_url_encrypted: string | null; // bytea, same `\x`-hex transport
   outlook_feed_name: string | null;
@@ -34,6 +37,7 @@ export interface CalDavSettings {
 
 const CALDAV_COLUMNS =
   'caldav_apple_id, caldav_app_password_encrypted, caldav_calendar_url, caldav_status, ' +
+  'caldav_read_calendars, ' +
   'outlook_ics_url_encrypted, outlook_feed_name, outlook_status, outlook_cached_busy, outlook_fetched_at';
 
 export async function getSettings(userId: string): Promise<CalDavSettings | null> {

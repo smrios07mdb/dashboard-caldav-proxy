@@ -1,8 +1,9 @@
 import { z } from 'zod';
-import { CalDavError, getBusy, type PlannerEvent } from '../_lib/caldav.js';
+import { CalDavError, getBusy, type CalendarOutcome, type PlannerEvent } from '../_lib/caldav.js';
 import { decrypt } from '../_lib/crypto.js';
 import { caldavErrorResponse, calendarRoute, jsonResponse } from '../_lib/http.js';
 import { fetchIcsFeed, IcsError, parseIcsBusy, type OutlookBusyInterval } from '../_lib/ics.js';
+import { parseReadCalendars } from '../_lib/readSet.js';
 import { byteaToBuffer, getSettings, updateSettings } from '../_lib/supabase.js';
 
 const Query = z.object({
@@ -15,6 +16,8 @@ interface TaggedInterval {
   end: string;
   source: 'icloud' | 'outlook';
   title?: string;
+  /** iCloud only (chunk 51): display name of the calendar it came from. */
+  calendar?: string;
 }
 
 export default {
@@ -56,11 +59,19 @@ export default {
     let plannerEvents: PlannerEvent[] = [];
 
     // ── iCloud ───────────────────────────────────────────────────────────────
+    // Chunk 51: the READ set decides which calendars contribute busy; the
+    // write target is always fetched for `plannerEvents`. A null read set
+    // (not initialized) is the legacy single-calendar read.
     let icloudOk = Boolean(icloudCreds);
+    let icloudCalendars: CalendarOutcome[] = [];
     if (icloudCreds) {
       const password = await decrypt(byteaToBuffer(icloudCreds.passwordEncrypted));
+      const readSet = parseReadCalendars(settings?.caldav_read_calendars) ?? [
+        { url: icloudCreds.calendarUrl, name: '', enabled: true },
+      ];
       try {
         const result = await getBusy(
+          readSet,
           icloudCreds.calendarUrl,
           icloudCreds.appleId,
           password,
@@ -69,6 +80,10 @@ export default {
         );
         merged.push(...result.intervals.map((i) => ({ ...i, source: 'icloud' as const })));
         plannerEvents = result.plannerEvents;
+        icloudCalendars = result.calendars;
+        // `ok` = at least one calendar answered; partial failures are
+        // visible per calendar in `sources.icloud.calendars`.
+        icloudOk = result.calendars.some((c) => c.ok);
       } catch (err) {
         // iCloud-only: keep the legacy contract (401 auth_failed / 502) that
         // existing clients key off. With Outlook configured, one dead source
@@ -119,7 +134,11 @@ export default {
       busy: merged,
       plannerEvents,
       sources: {
-        icloud: { configured: Boolean(icloudCreds), ok: icloudOk },
+        icloud: {
+          configured: Boolean(icloudCreds),
+          ok: icloudOk,
+          calendars: icloudCalendars.map(({ url, name, ok }) => ({ url, name, ok })),
+        },
         outlook: {
           configured: Boolean(outlookUrlEncrypted),
           status: outlookStatus,

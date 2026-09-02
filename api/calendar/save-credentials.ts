@@ -25,6 +25,10 @@ export default {
       caldav_app_password_encrypted: bufferToBytea(encrypted),
       caldav_calendar_url: parsed.data.calendar_url,
       caldav_status: 'ok',
+      // Chunk 51: a fresh connection resets the READ set; the app
+      // re-initializes it to all-discovered / all-enabled on the next
+      // Planner mount (null → legacy single-calendar read until then).
+      caldav_read_calendars: null,
     });
     return jsonResponse(req, 200, { ok: true });
   }),

@@ -11,6 +11,7 @@ import {
   type DAVCalendar,
 } from './tsdav.js';
 import { expandCalendarBusy } from './busyExpand.js';
+import type { ReadCalendar } from './readSet.js';
 
 const ICLOUD_CALDAV_URL = 'https://caldav.icloud.com/';
 
@@ -115,6 +116,9 @@ export interface BusyInterval {
   start: string;
   end: string;
   title?: string;
+  /** Display name of the iCloud calendar the interval came from (chunk 51).
+   *  Absent on the legacy single-calendar path (null read set). */
+  calendar?: string;
 }
 
 /** A planner-block mirror found on the calendar (first expanded instance). */
@@ -131,7 +135,12 @@ export interface BusyResult {
 
 const PLANNER_UID_RE = /^UID:(hupo-block-[A-Za-z0-9-]+)\s*$/m;
 
-export async function getBusy(
+/**
+ * Busy + planner mirrors for ONE calendar. The `PLANNER_UID_RE` exclusion
+ * lives here, so it applies to every calendar the multi-read fetches — a
+ * mirror never becomes busy even if the write target changes later.
+ */
+export async function getCalendarBusy(
   calendarUrl: string,
   appleId: string,
   password: string,
@@ -180,6 +189,113 @@ export async function getBusy(
   intervals.sort((a, b) => a.start.localeCompare(b.start));
   plannerEvents.sort((a, b) => a.start.localeCompare(b.start));
   return { intervals, plannerEvents };
+}
+
+/** Per-calendar outcome of a multi-calendar read (chunk 51). */
+export interface CalendarOutcome {
+  url: string;
+  name: string;
+  ok: boolean;
+  kind?: CalDavErrorKind;
+}
+
+export interface MultiBusyResult {
+  intervals: BusyInterval[];
+  plannerEvents: PlannerEvent[];
+  calendars: CalendarOutcome[];
+}
+
+/** Max simultaneous `fetchCalendarObjects` calls per busy request. */
+export const BUSY_CONCURRENCY = 6;
+
+/**
+ * Multi-calendar read (chunk 51, D3). Fetch set = enabled calendars ∪ the
+ * write target (always fetched: planner mirrors live there and the
+ * reconcile depends on `plannerEvents`). Busy intervals come only from
+ * ENABLED calendars, each tagged `calendar: <name>`; `plannerEvents` is the
+ * union across every fetched calendar. One failing calendar never fails the
+ * response — it is reported `ok: false` in `calendars`. Throws only when
+ * every fetched calendar failed: all-auth → `CalDavError('auth')` (so the
+ * busy endpoint keeps its reconnect-banner contract), otherwise the first
+ * error. Concurrency is capped at `BUSY_CONCURRENCY`.
+ */
+export async function getBusy(
+  calendars: ReadCalendar[],
+  writeTargetUrl: string | null,
+  appleId: string,
+  password: string,
+  from: string,
+  to: string,
+): Promise<MultiBusyResult> {
+  const fetchSet: ReadCalendar[] = [];
+  const seen = new Set<string>();
+  for (const c of calendars) {
+    if (!c.enabled || seen.has(c.url)) continue;
+    seen.add(c.url);
+    fetchSet.push(c);
+  }
+  if (writeTargetUrl && !seen.has(writeTargetUrl)) {
+    const known = calendars.find((c) => c.url === writeTargetUrl);
+    fetchSet.push({ url: writeTargetUrl, name: known?.name ?? '', enabled: false });
+  }
+
+  const settled = await mapPool(fetchSet, BUSY_CONCURRENCY, (c) =>
+    getCalendarBusy(c.url, appleId, password, from, to),
+  );
+
+  const intervals: BusyInterval[] = [];
+  const plannerEvents: PlannerEvent[] = [];
+  const outcomes: CalendarOutcome[] = [];
+  const errors: unknown[] = [];
+  settled.forEach((r, i) => {
+    const c = fetchSet[i]!;
+    if (r.status === 'fulfilled') {
+      outcomes.push({ url: c.url, name: c.name, ok: true });
+      plannerEvents.push(...r.value.plannerEvents);
+      if (c.enabled) {
+        for (const iv of r.value.intervals) {
+          intervals.push(c.name ? { ...iv, calendar: c.name } : iv);
+        }
+      }
+    } else {
+      const err = r.reason instanceof CalDavError ? r.reason : classifyError(r.reason);
+      outcomes.push({ url: c.url, name: c.name, ok: false, kind: err.kind });
+      errors.push(err);
+    }
+  });
+
+  if (fetchSet.length > 0 && errors.length === fetchSet.length) {
+    if (errors.every((e) => e instanceof CalDavError && e.kind === 'auth')) {
+      throw new CalDavError('auth', (errors[0] as CalDavError).message);
+    }
+    throw errors[0];
+  }
+
+  intervals.sort((a, b) => a.start.localeCompare(b.start));
+  plannerEvents.sort((a, b) => a.start.localeCompare(b.start));
+  return { intervals, plannerEvents, calendars: outcomes };
+}
+
+/** `Promise.allSettled` over `items` with at most `limit` tasks in flight. */
+async function mapPool<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<PromiseSettledResult<R>[]> {
+  const results: PromiseSettledResult<R>[] = new Array(items.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < items.length) {
+      const i = next++;
+      try {
+        results[i] = { status: 'fulfilled', value: await fn(items[i]!) };
+      } catch (reason) {
+        results[i] = { status: 'rejected', reason };
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
 }
 
 export interface NewEvent {
