@@ -1,26 +1,12 @@
-import { getEncryptedAiKey, getLegacyAiKey, requestTriage, TriageBody } from '../_lib/ai.js';
-import { decrypt, encrypt } from '../_lib/crypto.js';
+import { getEncryptedAiKey, requestTriage, TriageBody } from '../_lib/ai.js';
+import { decrypt } from '../_lib/crypto.js';
 import { calendarRoute, jsonResponse } from '../_lib/http.js';
-import { bufferToBytea, byteaToBuffer, updateSettings } from '../_lib/supabase.js';
+import { byteaToBuffer, updateSettings } from '../_lib/supabase.js';
 
-/**
- * Resolve the caller's Anthropic key. Prefers the encrypted column; if it is
- * empty and a legacy plaintext `ai_api_key` exists, migrates it in place
- * (chunk 55 D5) so the operator never has to re-paste a key Anthropic's
- * console will not show again.
- */
+/** Resolve the caller's Anthropic key: the decrypted stored key, or null. */
 async function resolveKey(userId: string): Promise<string | null> {
   const stored = await getEncryptedAiKey(userId);
-  if (stored) return decrypt(byteaToBuffer(stored));
-
-  const legacy = await getLegacyAiKey(userId);
-  if (!legacy) return null;
-  await updateSettings(userId, {
-    ai_api_key_encrypted: bufferToBytea(await encrypt(legacy)),
-    ai_status: 'ok',
-    ai_api_key: null,
-  });
-  return legacy;
+  return stored ? decrypt(byteaToBuffer(stored)) : null;
 }
 
 export default {

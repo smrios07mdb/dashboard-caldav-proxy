@@ -1,3 +1,5 @@
+import { readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Same shape as endpoints.test.ts: mock the lib layer, keep the pure helpers.
@@ -42,7 +44,7 @@ const ANTHROPIC_JSON = {
 
 const fetchMock = vi.fn();
 // Column → value for the settings row; every select is recorded so the tests
-// can assert which columns were read (D5: the legacy column has its own select).
+// can assert which columns were read.
 let row: Record<string, unknown> | null;
 let selects: string[];
 
@@ -57,7 +59,7 @@ beforeEach(() => {
   vi.mocked(encrypt).mockResolvedValue(Buffer.from([0x0a, 0x0b]));
   vi.mocked(decrypt).mockResolvedValue('sk-ant-stored');
   vi.stubGlobal('fetch', fetchMock);
-  row = { ai_api_key_encrypted: null, ai_api_key: null };
+  row = { ai_api_key_encrypted: null };
   selects = [];
   vi.mocked(getClient).mockReturnValue({
     from: (table: string) => ({
@@ -96,7 +98,7 @@ function send(
 }
 
 describe('POST /api/ai/key', () => {
-  it('validates with Anthropic, then stores the encrypted key and nulls the legacy column', async () => {
+  it('validates with Anthropic, then stores the encrypted key', async () => {
     fetchMock.mockResolvedValue(anthropic(200, { data: [] }));
     const res = await send(key, KEY_URL, 'POST', { api_key: '  sk-ant-new  ' });
 
@@ -115,7 +117,6 @@ describe('POST /api/ai/key', () => {
     expect(updateSettings).toHaveBeenCalledWith('user-1', {
       ai_api_key_encrypted: '\\x0a0b',
       ai_status: 'ok',
-      ai_api_key: null,
     });
   });
 
@@ -177,13 +178,12 @@ describe('POST /api/ai/key', () => {
 });
 
 describe('DELETE /api/ai/key', () => {
-  it('clears both key columns and resets the status', async () => {
+  it('clears the key column and resets the status', async () => {
     const res = await send(key, KEY_URL, 'DELETE');
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true });
     expect(updateSettings).toHaveBeenCalledWith('user-1', {
       ai_api_key_encrypted: null,
-      ai_api_key: null,
       ai_status: 'unconfigured',
     });
     expect(fetchMock).not.toHaveBeenCalled();
@@ -192,7 +192,7 @@ describe('DELETE /api/ai/key', () => {
 
 describe('POST /api/ai/triage', () => {
   it('decrypts the stored key and returns Anthropic’s JSON unmodified', async () => {
-    row = { ai_api_key_encrypted: '\\x6162', ai_api_key: null };
+    row = { ai_api_key_encrypted: '\\x6162' };
     fetchMock.mockResolvedValue(anthropic(200, ANTHROPIC_JSON));
     const res = await send(triage, TRIAGE_URL, 'POST', TRIAGE_BODY);
 
@@ -217,12 +217,11 @@ describe('POST /api/ai/triage', () => {
     expect(MODEL).toBe('claude-haiku-5-5');
     expect(MAX_TOKENS).toBe(800);
 
-    // The legacy column is not read when the encrypted one is present.
     expect(selects).toEqual(['settings.ai_api_key_encrypted']);
     expect(updateSettings).not.toHaveBeenCalled();
   });
 
-  it('no key in either column → 412 missing_key, Anthropic not called', async () => {
+  it('no stored key → 412 missing_key, Anthropic not called', async () => {
     const res = await send(triage, TRIAGE_URL, 'POST', TRIAGE_BODY);
     expect(res.status).toBe(412);
     expect(await res.json()).toMatchObject({ error: 'missing_key' });
@@ -236,40 +235,8 @@ describe('POST /api/ai/triage', () => {
     expect(res.status).toBe(412);
   });
 
-  it('D5: migrates a legacy plaintext key, then proceeds with it', async () => {
-    row = { ai_api_key_encrypted: null, ai_api_key: ' sk-ant-legacy ' };
-    fetchMock.mockResolvedValue(anthropic(200, ANTHROPIC_JSON));
-    const res = await send(triage, TRIAGE_URL, 'POST', TRIAGE_BODY);
-
-    expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true, data: ANTHROPIC_JSON });
-    // Two separate single-column selects — the legacy one only after a miss.
-    expect(selects).toEqual(['settings.ai_api_key_encrypted', 'settings.ai_api_key']);
-    expect(encrypt).toHaveBeenCalledWith('sk-ant-legacy');
-    expect(decrypt).not.toHaveBeenCalled();
-    expect(updateSettings).toHaveBeenCalledTimes(1);
-    expect(updateSettings).toHaveBeenCalledWith('user-1', {
-      ai_api_key_encrypted: '\\x0a0b',
-      ai_status: 'ok',
-      ai_api_key: null,
-    });
-    expect(fetchMock.mock.calls[0]![1].headers['x-api-key']).toBe('sk-ant-legacy');
-    // The migration write lands before the Anthropic call.
-    expect(vi.mocked(updateSettings).mock.invocationCallOrder[0]!).toBeLessThan(
-      fetchMock.mock.invocationCallOrder[0]!,
-    );
-  });
-
-  it('D5: a blank legacy key is not migrated → 412', async () => {
-    row = { ai_api_key_encrypted: null, ai_api_key: '   ' };
-    const res = await send(triage, TRIAGE_URL, 'POST', TRIAGE_BODY);
-    expect(res.status).toBe(412);
-    expect(encrypt).not.toHaveBeenCalled();
-    expect(updateSettings).not.toHaveBeenCalled();
-  });
-
   it.each([401, 403])('Anthropic %i → ai_status auth_failed + 422 bad_key', async (status) => {
-    row = { ai_api_key_encrypted: '\\x6162', ai_api_key: null };
+    row = { ai_api_key_encrypted: '\\x6162' };
     fetchMock.mockResolvedValue(anthropic(status));
     const res = await send(triage, TRIAGE_URL, 'POST', TRIAGE_BODY);
     expect(res.status).toBe(422);
@@ -279,7 +246,7 @@ describe('POST /api/ai/triage', () => {
   });
 
   it.each([400, 429, 500, 529])('Anthropic %i → 502 upstream, status untouched', async (status) => {
-    row = { ai_api_key_encrypted: '\\x6162', ai_api_key: null };
+    row = { ai_api_key_encrypted: '\\x6162' };
     fetchMock.mockResolvedValue(anthropic(status));
     const res = await send(triage, TRIAGE_URL, 'POST', TRIAGE_BODY);
     expect(res.status).toBe(502);
@@ -288,7 +255,7 @@ describe('POST /api/ai/triage', () => {
   });
 
   it('network failure → 502 upstream', async () => {
-    row = { ai_api_key_encrypted: '\\x6162', ai_api_key: null };
+    row = { ai_api_key_encrypted: '\\x6162' };
     fetchMock.mockRejectedValue(new TypeError('fetch failed'));
     const res = await send(triage, TRIAGE_URL, 'POST', TRIAGE_BODY);
     expect(res.status).toBe(502);
@@ -296,7 +263,7 @@ describe('POST /api/ai/triage', () => {
   });
 
   it('a non-JSON 2xx from Anthropic → 502 upstream', async () => {
-    row = { ai_api_key_encrypted: '\\x6162', ai_api_key: null };
+    row = { ai_api_key_encrypted: '\\x6162' };
     fetchMock.mockResolvedValue(new Response('<html>', { status: 200 }));
     const res = await send(triage, TRIAGE_URL, 'POST', TRIAGE_BODY);
     expect(res.status).toBe(502);
@@ -321,7 +288,7 @@ describe('POST /api/ai/triage', () => {
   });
 
   it('accepts 300 tasks and null due_at / priority', async () => {
-    row = { ai_api_key_encrypted: '\\x6162', ai_api_key: null };
+    row = { ai_api_key_encrypted: '\\x6162' };
     fetchMock.mockResolvedValue(anthropic(200, ANTHROPIC_JSON));
     const tasks = Array.from({ length: 300 }, () => ({ ...TASK, due_at: null, priority: null }));
     const res = await send(triage, TRIAGE_URL, 'POST', { ...TRIAGE_BODY, tasks });
@@ -329,14 +296,14 @@ describe('POST /api/ai/triage', () => {
   });
 
   it('never returns the key, on success or failure', async () => {
-    row = { ai_api_key_encrypted: '\\x6162', ai_api_key: null };
+    row = { ai_api_key_encrypted: '\\x6162' };
     fetchMock.mockResolvedValue(anthropic(401));
     const res = await send(triage, TRIAGE_URL, 'POST', TRIAGE_BODY);
     expect(await res.text()).not.toContain('sk-ant-stored');
   });
 
   it('a decrypt failure is a 500 without internals', async () => {
-    row = { ai_api_key_encrypted: '\\x6162', ai_api_key: null };
+    row = { ai_api_key_encrypted: '\\x6162' };
     vi.mocked(decrypt).mockRejectedValue(new Error('Unsupported state or unable to authenticate'));
     const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
     const res = await send(triage, TRIAGE_URL, 'POST', TRIAGE_BODY);
@@ -352,5 +319,42 @@ describe('POST /api/ai/triage', () => {
     const res = await send(triage, TRIAGE_URL, 'POST', TRIAGE_BODY);
     expect(res.status).toBe(401);
     expect(selects).toEqual([]);
+  });
+});
+
+describe('dropped legacy key column (chunk 56)', () => {
+  // Assembled so this file does not itself name the column.
+  const LEGACY = ['ai', 'api', 'key'].join('_');
+  const names = (value: string) => new RegExp(`${LEGACY}(?!_encrypted)`).test(value);
+
+  it('no select or update on any /api/ai/* path names it', async () => {
+    row = { ai_api_key_encrypted: '\\x6162' };
+    fetchMock.mockImplementation(async () => anthropic(200, ANTHROPIC_JSON));
+    await send(key, KEY_URL, 'POST', { api_key: 'sk-ant-new' });
+    await send(triage, TRIAGE_URL, 'POST', TRIAGE_BODY);
+    fetchMock.mockImplementation(async () => anthropic(401));
+    await send(triage, TRIAGE_URL, 'POST', TRIAGE_BODY);
+    await send(key, KEY_URL, 'DELETE');
+
+    expect(selects).toEqual(['settings.ai_api_key_encrypted', 'settings.ai_api_key_encrypted']);
+    const updated = vi.mocked(updateSettings).mock.calls.flatMap(([, patch]) => Object.keys(patch));
+    expect(updated).toEqual([
+      'ai_api_key_encrypted',
+      'ai_status',
+      'ai_status',
+      'ai_api_key_encrypted',
+      'ai_status',
+    ]);
+    expect([...selects, ...updated].filter(names)).toEqual([]);
+  });
+
+  it('no /api/ai/* source file names it', () => {
+    const dir = join(process.cwd(), 'api');
+    const files = [
+      join(dir, '_lib', 'ai.ts'),
+      ...readdirSync(join(dir, 'ai')).map((f) => join(dir, 'ai', f)),
+    ];
+    expect(files.length).toBeGreaterThanOrEqual(3);
+    expect(files.filter((f) => names(readFileSync(f, 'utf8')))).toEqual([]);
   });
 });

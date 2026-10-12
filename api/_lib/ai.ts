@@ -124,13 +124,3 @@ async function selectColumn(userId: string, column: string): Promise<string | nu
 export function getEncryptedAiKey(userId: string): Promise<string | null> {
   return selectColumn(userId, 'ai_api_key_encrypted');
 }
-
-/**
- * Legacy plaintext key, read ONLY for the one-time lazy migration in
- * /api/ai/triage (chunk 55 D5). Deliberately its own select — never add this
- * column to CALDAV_COLUMNS; it is dropped in the next chunk.
- */
-export async function getLegacyAiKey(userId: string): Promise<string | null> {
-  const value = (await selectColumn(userId, 'ai_api_key'))?.trim();
-  return value ? value : null;
-}

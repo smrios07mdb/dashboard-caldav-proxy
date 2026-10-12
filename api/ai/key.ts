@@ -13,7 +13,6 @@ export default {
     if (req.method === 'DELETE') {
       await updateSettings(userId, {
         ai_api_key_encrypted: null,
-        ai_api_key: null,
         ai_status: 'unconfigured',
       });
       return jsonResponse(req, 200, { ok: true });
@@ -40,7 +39,6 @@ export default {
     await updateSettings(userId, {
       ai_api_key_encrypted: bufferToBytea(encrypted),
       ai_status: 'ok',
-      ai_api_key: null, // retire any legacy plaintext copy
     });
     return jsonResponse(req, 200, { ok: true });
   }),

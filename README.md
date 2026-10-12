@@ -172,11 +172,9 @@ available_minutes: 1–1440, timezone (≤64) }` with snake_case tasks
 priority`). The proxy owns `MODEL` (`claude-haiku-5-5`), `MAX_TOKENS` (800)
   and the system prompt (`api/_lib/ai.ts`). An Anthropic 401/403 sets
   `ai_status = 'auth_failed'` and answers `422 bad_key`.
-- **Legacy migration.** If `ai_api_key_encrypted` is null and the legacy
-  plaintext `settings.ai_api_key` is non-empty, triage encrypts it, nulls the
-  legacy column and proceeds. That column is read only there, in its own
-  select; it is dropped in a follow-up chunk — this proxy must stop selecting
-  it and be deployed **before** the drop.
+- **History.** The pre-chunk-55 plaintext `settings.ai_api_key` column was
+  lazily migrated by triage once, on 2026-10-12; chunk 56 removed every
+  reference here and dropped the column.
 
 ## Environment variables
 
