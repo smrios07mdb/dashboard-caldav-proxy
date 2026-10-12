@@ -10,7 +10,7 @@ canonical design.
 
 ## How it works
 
-- **Auth** — every `/api/calendar/*` request must send `Authorization: Bearer <supabase-jwt>`.
+- **Auth** — every `/api/calendar/*` and `/api/ai/*` request must send `Authorization: Bearer <supabase-jwt>`.
   The token is verified with `jose` against the project's JWKS (asymmetric **ES256**),
   and the `sub` claim is the only trusted user id. All Supabase reads/writes are
   scoped to that `sub` (the service-role key bypasses RLS, so this scoping is the
@@ -26,17 +26,20 @@ canonical design.
 All `/api/calendar/*` routes require a valid Supabase JWT and honor CORS for the
 origins in `ALLOWED_ORIGINS`.
 
-| Method & path                         | Body / query                                              | Success                                                                                   | Notable failures                                                         |
-| ------------------------------------- | --------------------------------------------------------- | ----------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| `GET /api/health`                     | —                                                         | `{ ok: true }`                                                                            | —                                                                        |
-| `POST /api/calendar/test-credentials` | `{ apple_id, app_password }`                              | `{ ok: true, calendars: [{ url, name }] }`                                                | `401 { error: "auth" }`, `400`                                           |
-| `POST /api/calendar/save-credentials` | `{ apple_id, app_password, calendar_url }`                | `{ ok: true }`                                                                            | `400`                                                                    |
-| `GET /api/calendar/calendars`         | —                                                         | `{ ok: true, calendars: [{ url, name }], writeTargetUrl }` (stored creds)                 | `412 { error: "no_credentials" }`, `401 { error: "auth_failed" }`        |
-| `GET /api/calendar/busy`              | `?from=<ISO>&to=<ISO>`                                    | `{ ok: true, busy: [{ start, end, source, title?, calendar? }], plannerEvents, sources }` | `412 { error: "no_credentials" }`, `401 { error: "auth_failed" }`        |
-| `POST /api/calendar/events`           | `{ title, start, end, description?, source?: 'planner' }` | `{ ok: true, uid }`                                                                       | `412`, `401 { error: "auth_failed" }`                                    |
-| `PATCH /api/calendar/events`          | `{ uid, title, start, end, description? }`                | `{ ok: true }`                                                                            | `400`, `412`, `401 { error: "auth_failed" }`                             |
-| `DELETE /api/calendar/events?uid=…`   | —                                                         | `{ ok: true }` / `{ ok: true, missing: true }` (already gone)                             | `400`, `412`, `401 { error: "auth_failed" }`                             |
-| `POST /api/calendar/outlook`          | `{ icsUrl: string \| null }`                              | `{ ok: true, feedName, eventCount }` / `{ ok: true, cleared: true }`                      | `422 { error: "invalid_url" \| "unreachable" \| "invalid_feed" }`, `400` |
+| Method & path                         | Body / query                                              | Success                                                                                   | Notable failures                                                                               |
+| ------------------------------------- | --------------------------------------------------------- | ----------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `GET /api/health`                     | —                                                         | `{ ok: true }`                                                                            | —                                                                                              |
+| `POST /api/calendar/test-credentials` | `{ apple_id, app_password }`                              | `{ ok: true, calendars: [{ url, name }] }`                                                | `401 { error: "auth" }`, `400`                                                                 |
+| `POST /api/calendar/save-credentials` | `{ apple_id, app_password, calendar_url }`                | `{ ok: true }`                                                                            | `400`                                                                                          |
+| `GET /api/calendar/calendars`         | —                                                         | `{ ok: true, calendars: [{ url, name }], writeTargetUrl }` (stored creds)                 | `412 { error: "no_credentials" }`, `401 { error: "auth_failed" }`                              |
+| `GET /api/calendar/busy`              | `?from=<ISO>&to=<ISO>`                                    | `{ ok: true, busy: [{ start, end, source, title?, calendar? }], plannerEvents, sources }` | `412 { error: "no_credentials" }`, `401 { error: "auth_failed" }`                              |
+| `POST /api/calendar/events`           | `{ title, start, end, description?, source?: 'planner' }` | `{ ok: true, uid }`                                                                       | `412`, `401 { error: "auth_failed" }`                                                          |
+| `PATCH /api/calendar/events`          | `{ uid, title, start, end, description? }`                | `{ ok: true }`                                                                            | `400`, `412`, `401 { error: "auth_failed" }`                                                   |
+| `DELETE /api/calendar/events?uid=…`   | —                                                         | `{ ok: true }` / `{ ok: true, missing: true }` (already gone)                             | `400`, `412`, `401 { error: "auth_failed" }`                                                   |
+| `POST /api/calendar/outlook`          | `{ icsUrl: string \| null }`                              | `{ ok: true, feedName, eventCount }` / `{ ok: true, cleared: true }`                      | `422 { error: "invalid_url" \| "unreachable" \| "invalid_feed" }`, `400`                       |
+| `POST /api/ai/key`                    | `{ api_key }`                                             | `{ ok: true }` (validated with Anthropic, stored encrypted)                               | `422 { error: "bad_key" }`, `502 { error: "upstream" }`, `400`                                 |
+| `DELETE /api/ai/key`                  | —                                                         | `{ ok: true }`                                                                            | —                                                                                              |
+| `POST /api/ai/triage`                 | `{ tasks, available_minutes, timezone }`                  | `{ ok: true, data }` (`data` = Anthropic Messages JSON, unmodified)                       | `412 { error: "missing_key" }`, `422 { error: "bad_key" }`, `502 { error: "upstream" }`, `400` |
 
 Missing/invalid JWT → `401 { ok: false, error: "unauthorized" }`. Upstream
 iCloud network/other failures → `502 { ok: false, error: "network" | "other" }`.
@@ -151,6 +154,29 @@ An iCloud auth failure with Outlook configured no longer fails the whole `busy`
 response: the Outlook intervals are served with `sources.icloud.ok: false`, and
 `caldav_status='auth_failed'` is still recorded (reconnect banner logic is
 unchanged).
+
+## AI triage (chunk 55)
+
+The dashboard's "What's next?" triage calls Anthropic **through this proxy**
+with the user's own key. The `/api/ai/*` routes use the same wrapper as the
+calendar routes (Supabase JWT, CORS, 500 without internals).
+
+- **Key storage.** `POST /api/ai/key` validates the key against Anthropic
+  (`GET /v1/models?limit=1`), AES-GCM-encrypts it with `CALDAV_ENCRYPTION_KEY`
+  and writes `settings.ai_api_key_encrypted` + `ai_status = 'ok'`. A rejected
+  key (`422 bad_key`) or an unreachable Anthropic (`502 upstream`) stores
+  nothing. `DELETE` clears it. No response ever contains the key.
+- **Triage.** `POST /api/ai/triage` takes `{ tasks: TriageTask[] (≤300),
+available_minutes: 1–1440, timezone (≤64) }` with snake_case tasks
+  (`task_id, title, subcategory_name, category_name, estimate_minutes, due_at,
+priority`). The proxy owns `MODEL` (`claude-haiku-5-5`), `MAX_TOKENS` (800)
+  and the system prompt (`api/_lib/ai.ts`). An Anthropic 401/403 sets
+  `ai_status = 'auth_failed'` and answers `422 bad_key`.
+- **Legacy migration.** If `ai_api_key_encrypted` is null and the legacy
+  plaintext `settings.ai_api_key` is non-empty, triage encrypts it, nulls the
+  legacy column and proceeds. That column is read only there, in its own
+  select; it is dropped in a follow-up chunk — this proxy must stop selecting
+  it and be deployed **before** the drop.
 
 ## Environment variables
 
