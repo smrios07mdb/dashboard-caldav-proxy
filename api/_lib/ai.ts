@@ -93,7 +93,11 @@ const ModelsPage = z.object({
 });
 
 export type ModelSource = 'resolved' | 'floor' | 'cache';
-export type ResolvedModel = { model: string; source: ModelSource };
+// `reason` is set only on a fresh floor: why the newest Haiku was not resolved.
+export type ResolvedModel = { model: string; source: ModelSource; reason?: string };
+
+/** A resolution failure whose message is safe to log (no key, no body text). */
+class ResolveError extends Error {}
 
 // Per warm instance, keyed by SHA-256 of the API key — the raw key is never a
 // map key and never logged. Nothing is persisted (Supabase is unaware of the
@@ -119,8 +123,10 @@ async function fetchNewestHaiku(apiKey: string, signal: AbortSignal): Promise<st
       `${ANTHROPIC_BASE}/models?limit=${MODELS_PAGE_LIMIT}&lifecycle=active${cursor}`,
       { headers: anthropicHeaders(apiKey), signal },
     );
-    if (!res.ok) throw new Error(`models ${res.status}`);
-    const parsed = ModelsPage.parse(await res.json());
+    if (!res.ok) throw new ResolveError(`models_${res.status}${await errorType(res)}`);
+    const pageResult = ModelsPage.safeParse(await res.json().catch(() => null));
+    if (!pageResult.success) throw new ResolveError('malformed');
+    const parsed = pageResult.data;
     for (const m of parsed.data) {
       // `line` and `lifecycle` are the API's own fields; the id text is never
       // matched. The lifecycle check repeats the query filter on purpose.
@@ -150,17 +156,35 @@ export async function resolveHaikuModel(
   if (hit && hit.expiresAt > Date.now()) return { model: hit.model, source: 'cache' };
 
   let found: string | null;
+  let reason = 'no_haiku';
   try {
     found = await fetchNewestHaiku(apiKey, signal);
-  } catch {
+  } catch (err) {
     found = null;
+    reason =
+      err instanceof ResolveError
+        ? err.message
+        : err instanceof Error && err.name === 'TimeoutError'
+          ? 'timeout'
+          : 'network';
   }
   const model = found ?? HAIKU_FLOOR;
   modelCache.set(key, {
     model,
     expiresAt: Date.now() + (found ? RESOLVED_TTL_MS : FLOOR_TTL_MS),
   });
-  return { model, source: found ? 'resolved' : 'floor' };
+  return found ? { model, source: 'resolved' } : { model, source: 'floor', reason };
+}
+
+/** `:<error.type>` from an Anthropic error body, if it is a plain token. */
+async function errorType(res: Response): Promise<string> {
+  try {
+    const body = (await res.json()) as { error?: { type?: unknown } } | null;
+    const type = body?.error?.type;
+    return typeof type === 'string' && /^[a-z_]{1,40}$/.test(type) ? `:${type}` : '';
+  } catch {
+    return '';
+  }
 }
 
 /** A 404 whose body says the *model* is gone (retired), not the route. */
@@ -198,7 +222,8 @@ export async function requestTriage(
     return { kind: 'upstream' };
   } finally {
     // One line per triage; no key material.
-    console.log(`triage model=${resolved.model} source=${resolved.source}`);
+    const why = resolved.reason ? ` reason=${resolved.reason}` : '';
+    console.log(`triage model=${resolved.model} source=${resolved.source}${why}`);
   }
   const kind = classify(res.status);
   if (kind !== 'ok') return { kind };

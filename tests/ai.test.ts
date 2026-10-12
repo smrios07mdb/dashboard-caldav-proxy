@@ -444,19 +444,30 @@ describe('latest Haiku resolution (chunk 57)', () => {
     expect(sentModels()).toEqual([HAIKU_FLOOR]);
   });
 
-  it.each<[string, Reply]>([
-    ['Models 500', reply(500)],
-    ['Models 529', reply(529)],
-    ['a network reject', () => Promise.reject(new TypeError('fetch failed'))],
-    ['a timeout', () => Promise.reject(new DOMException('timed out', 'TimeoutError'))],
-    ['zero Haiku', page([model('s-1', '2026-09-01T00:00:00Z', { line: 'sonnet' })])],
-    ['an empty list', page([])],
-    ['a malformed page', reply(200, { nope: true })],
-  ])('falls back to the floor on %s', async (_name, models) => {
+  it.each<[string, Reply, string]>([
+    ['Models 500', reply(500), 'models_500'],
+    [
+      'Models 529',
+      reply(529, { error: { type: 'overloaded_error' } }),
+      'models_529:overloaded_error',
+    ],
+    [
+      'Models 400',
+      reply(400, { error: { type: 'invalid_request_error', message: 'sk-ant-echo' } }),
+      'models_400:invalid_request_error',
+    ],
+    ['Models 400 with an odd type', reply(400, { error: { type: 'x sk-ant-echo' } }), 'models_400'],
+    ['a network reject', () => Promise.reject(new TypeError('fetch failed')), 'network'],
+    ['a timeout', () => Promise.reject(new DOMException('timed out', 'TimeoutError')), 'timeout'],
+    ['zero Haiku', page([model('s-1', '2026-09-01T00:00:00Z', { line: 'sonnet' })]), 'no_haiku'],
+    ['an empty list', page([]), 'no_haiku'],
+    ['a malformed page', reply(200, { nope: true }), 'malformed'],
+    ['a non-JSON page', () => new Response('<html>', { status: 200 }), 'malformed'],
+  ])('falls back to the floor on %s', async (_name, models, reason) => {
     routeFetch([models], [ok]);
     expect((await run()).status).toBe(200);
     expect(sentModels()).toEqual([HAIKU_FLOOR]);
-    expect(logged).toEqual([`triage model=${HAIKU_FLOOR} source=floor`]);
+    expect(logged).toEqual([`triage model=${HAIKU_FLOOR} source=floor reason=${reason}`]);
   });
 
   it('caches the floor for 5 minutes, then asks again', async () => {
@@ -474,7 +485,7 @@ describe('latest Haiku resolution (chunk 57)', () => {
     expect(callsTo('/models')).toHaveLength(2);
     expect(sentModels()[2]).toBe('m-new');
     expect(logged).toEqual([
-      `triage model=${HAIKU_FLOOR} source=floor`,
+      `triage model=${HAIKU_FLOOR} source=floor reason=models_500`,
       `triage model=${HAIKU_FLOOR} source=cache`,
       'triage model=m-new source=resolved',
     ]);
