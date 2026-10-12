@@ -1,10 +1,15 @@
+import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { getClient } from './supabase.js';
 
 // AI triage (ARCHITECTURE.md §10, chunk 55). The proxy owns the model, the
 // token cap and the system prompt; the browser sends only the task payload and
 // never sees the Anthropic key again.
-export const MODEL = 'claude-haiku-5-5';
+//
+// Chunk 57: the model is always the newest active Haiku, resolved at runtime
+// from `GET /v1/models` (Anthropic has no `-latest` alias). The floor is what
+// triage uses when that cannot be resolved — still a Haiku, never another line.
+export const HAIKU_FLOOR = 'claude-haiku-5-5';
 export const MAX_TOKENS = 800;
 
 export const SYSTEM_PROMPT =
@@ -19,6 +24,12 @@ const ANTHROPIC_BASE = 'https://api.anthropic.com/v1';
 const ANTHROPIC_VERSION = '2023-06-01';
 // Functions are capped at 15s (vercel.json); fail as `upstream` before that.
 const TIMEOUT_MS = 12_000;
+
+const MODELS_PAGE_LIMIT = 100;
+const MODELS_MAX_PAGES = 3;
+const RESOLVED_TTL_MS = 24 * 60 * 60 * 1000;
+// Short, so an outage doesn't hammer `/v1/models` but recovery is picked up.
+const FLOOR_TTL_MS = 5 * 60 * 1000;
 
 /** The per-task shape the model receives (snake_case, §10 `TriageTask`). */
 export const TriageTask = z.strictObject({
@@ -68,35 +79,126 @@ export async function validateKey(apiKey: string): Promise<AnthropicOutcome> {
   return kind === 'ok' ? { kind, data: undefined } : { kind };
 }
 
-/** The §10 Messages call. `data` is Anthropic's JSON, unmodified. */
+const ModelsPage = z.object({
+  data: z.array(
+    z.object({
+      id: z.string(),
+      line: z.string().nullish(),
+      lifecycle: z.string().nullish(),
+      created_at: z.string().nullish(),
+    }),
+  ),
+  has_more: z.boolean().nullish(),
+  last_id: z.string().nullish(),
+});
+
+export type ModelSource = 'resolved' | 'floor' | 'cache';
+export type ResolvedModel = { model: string; source: ModelSource };
+
+// Per warm instance, keyed by SHA-256 of the API key — the raw key is never a
+// map key and never logged. Nothing is persisted (Supabase is unaware of the
+// model).
+const modelCache = new Map<string, { model: string; expiresAt: number }>();
+
+function cacheKey(apiKey: string): string {
+  return createHash('sha256').update(apiKey).digest('hex');
+}
+
+/** Test seam: forget every cached model. */
+export function clearModelCache(): void {
+  modelCache.clear();
+}
+
+/** Newest active Haiku across at most three pages, or null if there is none. */
+async function fetchNewestHaiku(apiKey: string, signal: AbortSignal): Promise<string | null> {
+  let best: { id: string; createdAt: number } | null = null;
+  let afterId: string | null = null;
+  for (let page = 0; page < MODELS_MAX_PAGES; page++) {
+    const cursor: string = afterId ? `&after_id=${encodeURIComponent(afterId)}` : '';
+    const res = await fetch(
+      `${ANTHROPIC_BASE}/models?limit=${MODELS_PAGE_LIMIT}&lifecycle=active${cursor}`,
+      { headers: anthropicHeaders(apiKey), signal },
+    );
+    if (!res.ok) throw new Error(`models ${res.status}`);
+    const parsed = ModelsPage.parse(await res.json());
+    for (const m of parsed.data) {
+      // `line` and `lifecycle` are the API's own fields; the id text is never
+      // matched. The lifecycle check repeats the query filter on purpose.
+      if (m.line !== 'haiku' || m.lifecycle !== 'active') continue;
+      const parsedAt = Date.parse(m.created_at ?? '');
+      const createdAt = Number.isNaN(parsedAt) ? -Infinity : parsedAt;
+      // Strict `>`: on a tie the earlier entry wins (the API lists newest first).
+      if (!best || createdAt > best.createdAt) best = { id: m.id, createdAt };
+    }
+    if (!parsed.has_more || !parsed.last_id) break;
+    afterId = parsed.last_id;
+  }
+  return best?.id ?? null;
+}
+
+/**
+ * The model triage must use for this key: the newest active Haiku, cached for
+ * 24 h. Any failure — non-2xx, network, timeout, malformed page, no active
+ * Haiku — yields `HAIKU_FLOOR`, cached for 5 min.
+ */
+export async function resolveHaikuModel(
+  apiKey: string,
+  signal: AbortSignal = AbortSignal.timeout(TIMEOUT_MS),
+): Promise<ResolvedModel> {
+  const key = cacheKey(apiKey);
+  const hit = modelCache.get(key);
+  if (hit && hit.expiresAt > Date.now()) return { model: hit.model, source: 'cache' };
+
+  let found: string | null;
+  try {
+    found = await fetchNewestHaiku(apiKey, signal);
+  } catch {
+    found = null;
+  }
+  const model = found ?? HAIKU_FLOOR;
+  modelCache.set(key, {
+    model,
+    expiresAt: Date.now() + (found ? RESOLVED_TTL_MS : FLOOR_TTL_MS),
+  });
+  return { model, source: found ? 'resolved' : 'floor' };
+}
+
+/** A 404 whose body says the *model* is gone (retired), not the route. */
+async function isModelNotFound(res: Response): Promise<boolean> {
+  if (res.status !== 404) return false;
+  try {
+    const body = (await res.json()) as { error?: { type?: unknown } } | null;
+    return body?.error?.type === 'not_found_error';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The §10 Messages call. `data` is Anthropic's JSON, unmodified. Resolution
+ * and the Messages call share one 12 s budget, so the function answers
+ * `upstream` itself instead of being killed at the 15 s platform cap.
+ */
 export async function requestTriage(
   apiKey: string,
   body: TriageBody,
 ): Promise<AnthropicOutcome<unknown>> {
+  const signal = AbortSignal.timeout(TIMEOUT_MS);
+  let resolved = await resolveHaikuModel(apiKey, signal);
   let res: Response;
   try {
-    res = await fetch(`${ANTHROPIC_BASE}/messages`, {
-      method: 'POST',
-      headers: { ...anthropicHeaders(apiKey), 'content-type': 'application/json' },
-      body: JSON.stringify({
-        model: MODEL,
-        max_tokens: MAX_TOKENS,
-        system: SYSTEM_PROMPT,
-        messages: [
-          {
-            role: 'user',
-            content: JSON.stringify({
-              tasks: body.tasks,
-              available_minutes: body.available_minutes,
-              timezone: body.timezone,
-            }),
-          },
-        ],
-      }),
-      signal: AbortSignal.timeout(TIMEOUT_MS),
-    });
+    res = await postMessages(apiKey, resolved.model, body, signal);
+    if (await isModelNotFound(res)) {
+      // The cached/resolved model was retired under us: re-resolve, retry once.
+      modelCache.delete(cacheKey(apiKey));
+      resolved = await resolveHaikuModel(apiKey, signal);
+      res = await postMessages(apiKey, resolved.model, body, signal);
+    }
   } catch {
     return { kind: 'upstream' };
+  } finally {
+    // One line per triage; no key material.
+    console.log(`triage model=${resolved.model} source=${resolved.source}`);
   }
   const kind = classify(res.status);
   if (kind !== 'ok') return { kind };
@@ -105,6 +207,34 @@ export async function requestTriage(
   } catch {
     return { kind: 'upstream' };
   }
+}
+
+function postMessages(
+  apiKey: string,
+  model: string,
+  body: TriageBody,
+  signal: AbortSignal,
+): Promise<Response> {
+  return fetch(`${ANTHROPIC_BASE}/messages`, {
+    method: 'POST',
+    headers: { ...anthropicHeaders(apiKey), 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model,
+      max_tokens: MAX_TOKENS,
+      system: SYSTEM_PROMPT,
+      messages: [
+        {
+          role: 'user',
+          content: JSON.stringify({
+            tasks: body.tasks,
+            available_minutes: body.available_minutes,
+            timezone: body.timezone,
+          }),
+        },
+      ],
+    }),
+    signal,
+  });
 }
 
 async function selectColumn(userId: string, column: string): Promise<string | null> {
