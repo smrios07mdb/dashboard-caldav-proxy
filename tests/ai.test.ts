@@ -380,7 +380,7 @@ describe('POST /api/ai/triage', () => {
 });
 
 describe('latest Haiku resolution (chunk 57)', () => {
-  const MODELS_URL = 'https://api.anthropic.com/v1/models?limit=100&lifecycle=active';
+  const MODELS_URL = 'https://api.anthropic.com/v1/models?limit=100';
   const run = () => send(triage, TRIAGE_URL, 'POST', TRIAGE_BODY);
 
   beforeEach(() => {
@@ -459,8 +459,17 @@ describe('latest Haiku resolution (chunk 57)', () => {
     ['Models 400 with an odd type', reply(400, { error: { type: 'x sk-ant-echo' } }), 'models_400'],
     ['a network reject', () => Promise.reject(new TypeError('fetch failed')), 'network'],
     ['a timeout', () => Promise.reject(new DOMException('timed out', 'TimeoutError')), 'timeout'],
-    ['zero Haiku', page([model('s-1', '2026-09-01T00:00:00Z', { line: 'sonnet' })]), 'no_haiku'],
-    ['an empty list', page([]), 'no_haiku'],
+    [
+      'zero Haiku',
+      page([model('s-1', '2026-09-01T00:00:00Z', { line: 'sonnet' })]),
+      'no_haiku:seen=1,haiku=0',
+    ],
+    ['an empty list', page([]), 'no_haiku:seen=0,haiku=0'],
+    [
+      'only a deprecated Haiku',
+      page([model('m-dep', '2026-09-01T00:00:00Z', { lifecycle: 'deprecated' })]),
+      'no_haiku:seen=1,haiku=1',
+    ],
     ['a malformed page', reply(200, { nope: true }), 'malformed'],
     ['a non-JSON page', () => new Response('<html>', { status: 200 }), 'malformed'],
   ])('falls back to the floor on %s', async (_name, models, reason) => {

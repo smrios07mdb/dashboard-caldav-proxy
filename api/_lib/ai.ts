@@ -113,24 +113,32 @@ export function clearModelCache(): void {
   modelCache.clear();
 }
 
-/** Newest active Haiku across at most three pages, or null if there is none. */
-async function fetchNewestHaiku(apiKey: string, signal: AbortSignal): Promise<string | null> {
+/** Newest active Haiku across at most three pages; throws if there is none. */
+async function fetchNewestHaiku(apiKey: string, signal: AbortSignal): Promise<string> {
   let best: { id: string; createdAt: number } | null = null;
+  let seen = 0;
+  let haikus = 0;
   let afterId: string | null = null;
   for (let page = 0; page < MODELS_MAX_PAGES; page++) {
     const cursor: string = afterId ? `&after_id=${encodeURIComponent(afterId)}` : '';
-    const res = await fetch(
-      `${ANTHROPIC_BASE}/models?limit=${MODELS_PAGE_LIMIT}&lifecycle=active${cursor}`,
-      { headers: anthropicHeaders(apiKey), signal },
-    );
+    // No `lifecycle` query filter: Anthropic answered `lifecycle=active` with
+    // 400 invalid_request_error (prod, 2026-10-12). The default list is active
+    // + deprecated, and the per-entry check below keeps only active.
+    const res = await fetch(`${ANTHROPIC_BASE}/models?limit=${MODELS_PAGE_LIMIT}${cursor}`, {
+      headers: anthropicHeaders(apiKey),
+      signal,
+    });
     if (!res.ok) throw new ResolveError(`models_${res.status}${await errorType(res)}`);
     const pageResult = ModelsPage.safeParse(await res.json().catch(() => null));
     if (!pageResult.success) throw new ResolveError('malformed');
     const parsed = pageResult.data;
     for (const m of parsed.data) {
       // `line` and `lifecycle` are the API's own fields; the id text is never
-      // matched. The lifecycle check repeats the query filter on purpose.
-      if (m.line !== 'haiku' || m.lifecycle !== 'active') continue;
+      // matched.
+      seen++;
+      if (m.line !== 'haiku') continue;
+      haikus++;
+      if (m.lifecycle !== 'active') continue;
       const parsedAt = Date.parse(m.created_at ?? '');
       const createdAt = Number.isNaN(parsedAt) ? -Infinity : parsedAt;
       // Strict `>`: on a tie the earlier entry wins (the API lists newest first).
@@ -139,7 +147,10 @@ async function fetchNewestHaiku(apiKey: string, signal: AbortSignal): Promise<st
     if (!parsed.has_more || !parsed.last_id) break;
     afterId = parsed.last_id;
   }
-  return best?.id ?? null;
+  // The counts say whether the list was empty, had no Haiku, or had only
+  // non-active ones.
+  if (!best) throw new ResolveError(`no_haiku:seen=${seen},haiku=${haikus}`);
+  return best.id;
 }
 
 /**
@@ -156,7 +167,7 @@ export async function resolveHaikuModel(
   if (hit && hit.expiresAt > Date.now()) return { model: hit.model, source: 'cache' };
 
   let found: string | null;
-  let reason = 'no_haiku';
+  let reason = '';
   try {
     found = await fetchNewestHaiku(apiKey, signal);
   } catch (err) {
