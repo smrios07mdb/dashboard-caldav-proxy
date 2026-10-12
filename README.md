@@ -169,9 +169,25 @@ calendar routes (Supabase JWT, CORS, 500 without internals).
 - **Triage.** `POST /api/ai/triage` takes `{ tasks: TriageTask[] (≤300),
 available_minutes: 1–1440, timezone (≤64) }` with snake_case tasks
   (`task_id, title, subcategory_name, category_name, estimate_minutes, due_at,
-priority`). The proxy owns `MODEL` (`claude-haiku-5-5`), `MAX_TOKENS` (800)
-  and the system prompt (`api/_lib/ai.ts`). An Anthropic 401/403 sets
+priority`). The proxy owns the model, `MAX_TOKENS` (800) and the system
+  prompt (`api/_lib/ai.ts`). An Anthropic 401/403 sets
   `ai_status = 'auth_failed'` and answers `422 bad_key`.
+- **Model (chunk 57).** Triage always and only uses the latest Claude Haiku.
+  Anthropic has no `-latest` alias, so `resolveHaikuModel` reads
+  `GET /v1/models?limit=100&lifecycle=active` (at most 3 pages) with the
+  caller's key and picks the entry with `line === 'haiku'`,
+  `lifecycle === 'active'` and the greatest `created_at` — never by `id` text.
+  - **Floor.** `HAIKU_FLOOR` (`claude-haiku-5-5`) is used when that call fails,
+    times out or lists no active Haiku. Never another model line.
+  - **Cache.** In memory per warm instance, keyed by SHA-256 of the key: 24 h
+    for a resolved model, 5 min for the floor. Nothing is persisted.
+  - **Retired model.** A `404 not_found_error` from `/v1/messages` drops the
+    cache entry, re-resolves and retries once; a second failure is
+    `502 upstream`.
+  - **Budget.** Resolution and the Messages call share one 12 s timeout.
+  - **Log.** One line per triage: `triage model=<id> source=<resolved|floor|cache>`
+    (no key material).
+  - Key validation (`GET /v1/models?limit=1`) does not resolve or cache a model.
 - **History.** The pre-chunk-55 plaintext `settings.ai_api_key` column was
   lazily migrated by triage once, on 2026-10-12; chunk 56 removed every
   reference here and dropped the column.
