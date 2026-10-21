@@ -265,6 +265,9 @@ export function requestTriage(
   return callLatestHaiku(apiKey, 'triage', TIMEOUT_MS, (model) => ({
     model,
     max_tokens: MAX_TOKENS,
+    // Claude Haiku 5.5 thinks by default, and thinking can spend the whole
+    // 800-token cap before the JSON is written. Accepted at the default effort.
+    thinking: { type: 'disabled' },
     system: SYSTEM_PROMPT,
     messages: [
       {

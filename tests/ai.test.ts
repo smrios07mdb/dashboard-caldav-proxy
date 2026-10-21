@@ -268,6 +268,9 @@ describe('POST /api/ai/triage', () => {
     expect(JSON.parse(init.body)).toEqual({
       model: HAIKU_FLOOR,
       max_tokens: MAX_TOKENS,
+      // Claude Haiku 5.5 thinks by default; thinking spent the 800-token cap
+      // and cut the JSON off (stop_reason max_tokens, chunk 90 smoke 0900b).
+      thinking: { type: 'disabled' },
       system: SYSTEM_PROMPT,
       messages: [{ role: 'user', content: JSON.stringify(TRIAGE_BODY) }],
     });
