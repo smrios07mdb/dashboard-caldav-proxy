@@ -40,6 +40,7 @@ origins in `ALLOWED_ORIGINS`.
 | `POST /api/ai/key`                    | `{ api_key }`                                             | `{ ok: true }` (validated with Anthropic, stored encrypted)                               | `422 { error: "bad_key" }`, `502 { error: "upstream" }`, `400`                                 |
 | `DELETE /api/ai/key`                  | —                                                         | `{ ok: true }`                                                                            | —                                                                                              |
 | `POST /api/ai/triage`                 | `{ tasks, available_minutes, timezone }`                  | `{ ok: true, data }` (`data` = Anthropic Messages JSON, unmodified)                       | `412 { error: "missing_key" }`, `422 { error: "bad_key" }`, `502 { error: "upstream" }`, `400` |
+| `POST /api/ai/sort`                   | —                                                         | `{ ok, run_id, proposed, kept, skipped, remaining, usage }` (chunk 90)                    | `412`, `422 { error: "bad_key" }`, `502 { error: "upstream" \| "malformed" }`                  |
 
 Missing/invalid JWT → `401 { ok: false, error: "unauthorized" }`. Upstream
 iCloud network/other failures → `502 { ok: false, error: "network" | "other" }`.
@@ -215,6 +216,29 @@ null, new_list: { name, category: 'Work' | 'Personal' } | null, reason }] }`
 
 The proxy never moves a task or creates a list — the user approves in the app
 (`apply_routing`, dashboard migration 21). Logic: `api/_lib/router.ts`.
+
+### On demand: `POST /api/ai/sort` (chunk 90)
+
+The app's **Sort General** button. Supabase-JWT auth (like `/api/ai/triage`),
+empty body, acts on the JWT's user — not `ROUTER_USER_ID`. Same candidates,
+targets and proposal rules as above (`router.ts` takes a `RouterScope`
+`{ userId, minAgeMinutes }`), with the 10-minute age filter **off**. The proxy
+asks the latest Haiku (chunk-57 resolver) with the saved key: one request,
+`temperature 0`, `max_tokens 4000`, output forced through the
+`propose_sorting` tool (prompt and schema in `api/_lib/sortPrompt.ts`). At
+most 100 candidates per press, oldest first.
+
+- `200 { ok, run_id, proposed, kept, skipped, remaining, usage }` — `proposed`
+  rows have a destination, `kept` rows stay in General, `skipped` entries were
+  dropped (unsent / unknown ids, bad targets, repeats, malformed entries),
+  `remaining` candidates still have no proposal, `usage` is Anthropic's
+  `{ input_tokens, output_tokens }`. No candidates → `proposed: 0` and no
+  Anthropic call.
+- `412 missing_key`, `422 bad_key` (sets `ai_status = 'auth_failed'`),
+  `502 upstream`, `502 malformed` (no `propose_sorting` call, or its input is
+  not `{ proposals: [...] }`), `401` without a valid JWT.
+- Runs with `maxDuration: 60` (`vercel.json`; the specific pattern must come
+  before `api/**/*.ts`) and answers `upstream` itself at 50 s.
 
 ## Environment variables
 

@@ -1,6 +1,9 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
+    "api/ai/sort.ts": {
+      "maxDuration": 60
+    },
     "api/**/*.ts": {
       "maxDuration": 15
     }

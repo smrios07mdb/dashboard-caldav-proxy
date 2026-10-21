@@ -14,9 +14,14 @@ import { getClient } from './supabase.js';
  * Auth is a static bearer token (`ROUTER_TOKEN`) bound to one user
  * (`ROUTER_USER_ID`) — the scheduled task has no Supabase session. Every
  * query below is scoped to that user id (service-role client bypasses RLS).
+ *
+ * Chunk 90: the same core serves `POST /api/ai/sort` (the app's Sort General
+ * button, Supabase-JWT auth). Callers pass a `RouterScope` — whose rows, and
+ * how old a General task must be to count — so nothing here reads env.
  */
 
-export const CANDIDATE_MIN_AGE_MS = 10 * 60 * 1000;
+/** The router path's age filter (D1); the on-demand sort path passes 0. */
+export const ROUTER_MIN_AGE_MINUTES = 10;
 export const INBOX_LIMIT = 100;
 export const EXAMPLES_PER_TARGET = 8;
 export const EXAMPLE_WINDOW_DAYS = 90;
@@ -44,7 +49,13 @@ export function checkRouterAuth(req: Request): RouterAuth {
   return { ok: true, userId };
 }
 
-type RouterHandler = (req: Request, userId: string) => Promise<Response>;
+/** Whose rows, and the minimum task age (minutes) for a candidate. */
+export interface RouterScope {
+  userId: string;
+  minAgeMinutes: number;
+}
+
+type RouterHandler = (req: Request, scope: RouterScope) => Promise<Response>;
 
 export function routerRoute(handler: RouterHandler): (req: Request) => Promise<Response> {
   return async (req: Request): Promise<Response> => {
@@ -56,7 +67,7 @@ export function routerRoute(handler: RouterHandler): (req: Request) => Promise<R
       });
     }
     try {
-      return await handler(req, auth.userId);
+      return await handler(req, { userId: auth.userId, minAgeMinutes: ROUTER_MIN_AGE_MINUTES });
     } catch (err) {
       console.error('route error:', err);
       return jsonResponse(req, 500, { ok: false, error: 'internal' });
@@ -190,9 +201,9 @@ export async function insertProposals(rows: ProposalRow[]): Promise<void> {
 
 // ── pure core ─────────────────────────────────────────────────────────────
 
-/** D1: open General tasks, ≥10 min old, not already decided. Oldest first. */
-export function candidates(snap: Snapshot, now: Date): GeneralTaskRow[] {
-  const cutoff = now.getTime() - CANDIDATE_MIN_AGE_MS;
+/** D1: open General tasks, old enough, not already decided. Oldest first. */
+export function candidates(snap: Snapshot, now: Date, minAgeMinutes: number): GeneralTaskRow[] {
+  const cutoff = now.getTime() - minAgeMinutes * 60_000;
   return snap.generalTasks
     .filter((t) => Date.parse(t.created_at) <= cutoff && !snap.decidedTaskIds.has(t.id))
     .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at));
@@ -210,7 +221,7 @@ export function liveTargets(snap: Snapshot): SubcategoryRow[] {
     );
 }
 
-export function buildInbox(snap: Snapshot, now: Date) {
+export function buildInbox(snap: Snapshot, now: Date, scope: RouterScope) {
   const catName = new Map(snap.categories.map((c) => [c.id, c.name]));
   const subCat = new Map(snap.subcategories.map((s) => [s.id, s.category_id]));
   const examples = new Map<string, string[]>();
@@ -220,7 +231,7 @@ export function buildInbox(snap: Snapshot, now: Date) {
     examples.set(t.subcategory_id, list);
   }
   return {
-    tasks: candidates(snap, now)
+    tasks: candidates(snap, now, scope.minAgeMinutes)
       .slice(0, INBOX_LIMIT)
       .map((t) => ({
         task_id: t.id,
@@ -281,11 +292,12 @@ export type ProposeResult = {
 export function planProposals(
   snap: Snapshot,
   body: ProposeBody,
-  userId: string,
+  scope: RouterScope,
   now: Date,
   runId: string = randomUUID(),
 ): { runId: string; rows: ProposalRow[]; results: ProposeResult[] } {
-  const cand = new Map(candidates(snap, now).map((t) => [t.id, t]));
+  const userId = scope.userId;
+  const cand = new Map(candidates(snap, now, scope.minAgeMinutes).map((t) => [t.id, t]));
   const targets = new Map(liveTargets(snap).map((s) => [s.id, s]));
   const catByName = new Map(snap.categories.map((c) => [c.name, c]));
 

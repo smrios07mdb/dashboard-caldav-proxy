@@ -1,13 +1,6 @@
-import { getEncryptedAiKey, requestTriage, TriageBody } from '../_lib/ai.js';
-import { decrypt } from '../_lib/crypto.js';
+import { loadAiKey, requestTriage, TriageBody } from '../_lib/ai.js';
 import { calendarRoute, jsonResponse } from '../_lib/http.js';
-import { byteaToBuffer, updateSettings } from '../_lib/supabase.js';
-
-/** Resolve the caller's Anthropic key: the decrypted stored key, or null. */
-async function resolveKey(userId: string): Promise<string | null> {
-  const stored = await getEncryptedAiKey(userId);
-  return stored ? decrypt(byteaToBuffer(stored)) : null;
-}
+import { updateSettings } from '../_lib/supabase.js';
 
 export default {
   fetch: calendarRoute(async (req, userId) => {
@@ -19,7 +12,7 @@ export default {
       return jsonResponse(req, 400, { ok: false, error: 'invalid_request' });
     }
 
-    const apiKey = await resolveKey(userId);
+    const apiKey = await loadAiKey(userId);
     if (!apiKey) {
       return jsonResponse(req, 412, { ok: false, error: 'missing_key' });
     }

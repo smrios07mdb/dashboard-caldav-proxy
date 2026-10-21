@@ -22,6 +22,8 @@ const TOKEN = 'test-router-token-0123456789';
 const NOW = new Date('2026-10-21T12:00:00.000Z');
 const OLD = '2026-10-21T11:00:00.000Z'; // 1 h before NOW
 const FRESH = '2026-10-21T11:55:00.000Z'; // 5 min before NOW
+// Chunk 90: the router path keeps the 10-minute age filter.
+const SCOPE = { userId: USER, minAgeMinutes: 10 };
 
 const id = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
 const WORK = id(1);
@@ -149,13 +151,13 @@ describe('inbox (D1, D2)', () => {
       generalTasks: [task(1), task(2), task(3), task(4, WORK_GENERAL, FRESH), task(6)],
       decidedTaskIds: new Set([id(102), id(103)]), // e.g. one pending, one approved
     });
-    const out = buildInbox(snap, NOW);
+    const out = buildInbox(snap, NOW, SCOPE);
     expect(out.tasks.map((t) => t.task_id)).toEqual([id(101), id(106)]);
   });
 
   it('a task whose only proposal went stale is listed again', () => {
     // Stale rows are not loaded into decidedTaskIds (status filter).
-    const out = buildInbox(snapshot({ decidedTaskIds: new Set() }), NOW);
+    const out = buildInbox(snapshot({ decidedTaskIds: new Set() }), NOW, SCOPE);
     expect(out.tasks.map((t) => t.task_id)).toContain(id(101));
   });
 
@@ -167,14 +169,14 @@ describe('inbox (D1, D2)', () => {
         new Date(Date.parse(OLD) - i * 1000).toISOString(),
       ),
     );
-    const out = buildInbox(snapshot({ generalTasks: many }), NOW);
+    const out = buildInbox(snapshot({ generalTasks: many }), NOW, SCOPE);
     expect(out.tasks).toHaveLength(100);
     expect(out.tasks[0]?.task_id).toBe(id(219));
     expect(new Set(out.tasks.map((t) => t.category_name))).toEqual(new Set(['Work', 'Personal']));
   });
 
   it('targets are live non-General lists of either category, with ≤8 examples', () => {
-    const out = buildInbox(snapshot(), NOW);
+    const out = buildInbox(snapshot(), NOW, SCOPE);
     expect(out.targets.map((t) => t.subcategory_id)).toEqual([TRIPS, TAXES]);
     expect(out.targets.find((t) => t.subcategory_id === TAXES)?.examples).toHaveLength(8);
     expect(out.targets.find((t) => t.subcategory_id === TRIPS)?.category_name).toBe('Personal');
@@ -191,7 +193,7 @@ describe('inbox (D1, D2)', () => {
 
 describe('propose (D3, D4, D5)', () => {
   it('a Work task may go to a Personal list (cross-category)', () => {
-    const { rows, results } = planProposals(snapshot(), body([to(1, TRIPS)]), USER, NOW, 'run');
+    const { rows, results } = planProposals(snapshot(), body([to(1, TRIPS)]), SCOPE, NOW, 'run');
     expect(results).toEqual([{ task_id: id(101), status: 'proposed' }]);
     expect(rows[0]).toMatchObject({
       task_id: id(101),
@@ -207,7 +209,7 @@ describe('propose (D3, D4, D5)', () => {
     const { rows, results } = planProposals(
       snapshot(),
       body([to(1, PERSONAL_GENERAL), to(2, ARCHIVED), to(3, id(999))]),
-      USER,
+      SCOPE,
       NOW,
     );
     expect(results.map((r) => r.detail)).toEqual(['bad_target', 'bad_target', 'bad_target']);
@@ -219,13 +221,13 @@ describe('propose (D3, D4, D5)', () => {
       generalTasks: [task(1, WORK_GENERAL, FRESH), task(2)],
       decidedTaskIds: new Set([id(102)]),
     });
-    const { rows, results } = planProposals(snap, body([keep(1), keep(2), keep(7)]), USER, NOW);
+    const { rows, results } = planProposals(snap, body([keep(1), keep(2), keep(7)]), SCOPE, NOW);
     expect(results.every((r) => r.status === 'skipped' && r.detail === 'not_candidate')).toBe(true);
     expect(rows).toHaveLength(0);
   });
 
   it('keep writes both destinations null', () => {
-    const { rows } = planProposals(snapshot(), body([keep(1)]), USER, NOW);
+    const { rows } = planProposals(snapshot(), body([keep(1)]), SCOPE, NOW);
     expect(rows[0]).toMatchObject({
       to_subcategory_id: null,
       new_list_name: null,
@@ -234,7 +236,7 @@ describe('propose (D3, D4, D5)', () => {
   });
 
   it('a new list backed by one task falls back to keep', () => {
-    const { rows, results } = planProposals(snapshot(), body([newList(1, 'Solo')]), USER, NOW);
+    const { rows, results } = planProposals(snapshot(), body([newList(1, 'Solo')]), SCOPE, NOW);
     expect(results[0]).toEqual({
       task_id: id(101),
       status: 'kept_fallback',
@@ -247,7 +249,7 @@ describe('propose (D3, D4, D5)', () => {
     const { rows, results } = planProposals(
       snapshot(),
       body([newList(1, '  Hiring '), newList(2, 'hiring')]),
-      USER,
+      SCOPE,
       NOW,
       'run',
     );
@@ -262,14 +264,14 @@ describe('propose (D3, D4, D5)', () => {
     const { results } = planProposals(
       snapshot(),
       body([newList(1, 'Admin'), newList(2, 'Admin', 'Personal')]),
-      USER,
+      SCOPE,
       NOW,
     );
     expect(results.map((r) => r.detail)).toEqual(['new_list_min', 'new_list_min']);
   });
 
   it('a name matching an existing list in that category becomes that list', () => {
-    const { rows, results } = planProposals(snapshot(), body([newList(1, 'taxes')]), USER, NOW);
+    const { rows, results } = planProposals(snapshot(), body([newList(1, 'taxes')]), SCOPE, NOW);
     expect(results[0]).toEqual({ task_id: id(101), status: 'proposed', detail: 'existing_list' });
     expect(rows[0]).toMatchObject({ to_subcategory_id: TAXES, new_list_name: null });
   });
@@ -278,7 +280,7 @@ describe('propose (D3, D4, D5)', () => {
     const { results } = planProposals(
       snapshot(),
       body([newList(1, 'General'), newList(2, 'general')]),
-      USER,
+      SCOPE,
       NOW,
     );
     expect(results.map((r) => r.status)).toEqual(['kept_fallback', 'kept_fallback']);
@@ -300,7 +302,7 @@ describe('propose (D3, D4, D5)', () => {
         newList(8, 'D'),
         newList(9, 'D'),
       ]),
-      USER,
+      SCOPE,
       NOW,
     );
     expect(new Set(rows.filter((r) => r.new_list_name).map((r) => r.new_list_name))).toEqual(
@@ -345,5 +347,24 @@ describe('propose (D3, D4, D5)', () => {
       expect(res.status).toBe(400);
     }
     expect(insertProposals).not.toHaveBeenCalled();
+  });
+});
+
+describe('age filter by path (chunk 90 D2)', () => {
+  it('on (10 min) on the router path, off at minAgeMinutes 0', async () => {
+    const snap = snapshot({ generalTasks: [task(1), task(2, WORK_GENERAL, FRESH)] });
+    vi.mocked(loadSnapshot).mockResolvedValue(snap);
+    const res = await inbox.fetch(req('GET', '/api/route/inbox'));
+    const json = (await res.json()) as { tasks: { task_id: string }[] };
+    expect(json.tasks.map((t) => t.task_id)).toEqual([id(101)]);
+    const open = buildInbox(snap, NOW, { userId: USER, minAgeMinutes: 0 });
+    expect(open.tasks.map((t) => t.task_id)).toEqual([id(101), id(102)]);
+    const { results } = planProposals(
+      snap,
+      body([keep(2)]),
+      { userId: USER, minAgeMinutes: 0 },
+      NOW,
+    );
+    expect(results[0]?.status).toBe('proposed');
   });
 });

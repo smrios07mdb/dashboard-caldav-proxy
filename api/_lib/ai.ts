@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
-import { getClient } from './supabase.js';
+import { decrypt } from './crypto.js';
+import { SORT_MAX_TOKENS, SORT_SYSTEM_PROMPT, SORT_TOOL, SORT_TOOL_NAME } from './sortPrompt.js';
+import { byteaToBuffer, getClient } from './supabase.js';
 
 // AI triage (ARCHITECTURE.md §10, chunk 55). The proxy owns the model, the
 // token cap and the system prompt; the browser sends only the task payload and
@@ -24,6 +26,9 @@ const ANTHROPIC_BASE = 'https://api.anthropic.com/v1';
 const ANTHROPIC_VERSION = '2023-06-01';
 // Functions are capped at 15s (vercel.json); fail as `upstream` before that.
 const TIMEOUT_MS = 12_000;
+// Chunk 90: a sort press can write up to 4000 tokens, so `api/ai/sort.ts` runs
+// with a 60 s cap (vercel.json) and answers `upstream` itself at 50 s.
+export const SORT_TIMEOUT_MS = 50_000;
 
 const MODELS_PAGE_LIMIT = 100;
 const MODELS_MAX_PAGES = 3;
@@ -210,31 +215,33 @@ async function isModelNotFound(res: Response): Promise<boolean> {
 }
 
 /**
- * The §10 Messages call. `data` is Anthropic's JSON, unmodified. Resolution
- * and the Messages call share one 12 s budget, so the function answers
- * `upstream` itself instead of being killed at the 15 s platform cap.
+ * One Messages call with the resolved model. Resolution and the call share
+ * one budget, so the function answers `upstream` itself instead of being
+ * killed at the platform cap. A retired model (404 `not_found_error`) drops
+ * the cache entry, re-resolves and retries once (chunk 57 D4). `label` names
+ * the one log line per call; it never carries key material or task content.
  */
-export async function requestTriage(
+async function callLatestHaiku(
   apiKey: string,
-  body: TriageBody,
+  label: string,
+  timeoutMs: number,
+  build: (model: string) => Record<string, unknown>,
 ): Promise<AnthropicOutcome<unknown>> {
-  const signal = AbortSignal.timeout(TIMEOUT_MS);
+  const signal = AbortSignal.timeout(timeoutMs);
   let resolved = await resolveHaikuModel(apiKey, signal);
   let res: Response;
   try {
-    res = await postMessages(apiKey, resolved.model, body, signal);
+    res = await postMessages(apiKey, build(resolved.model), signal);
     if (await isModelNotFound(res)) {
-      // The cached/resolved model was retired under us: re-resolve, retry once.
       modelCache.delete(cacheKey(apiKey));
       resolved = await resolveHaikuModel(apiKey, signal);
-      res = await postMessages(apiKey, resolved.model, body, signal);
+      res = await postMessages(apiKey, build(resolved.model), signal);
     }
   } catch {
     return { kind: 'upstream' };
   } finally {
-    // One line per triage; no key material.
     const why = resolved.reason ? ` reason=${resolved.reason}` : '';
-    console.log(`triage model=${resolved.model} source=${resolved.source}${why}`);
+    console.log(`${label} model=${resolved.model} source=${resolved.source}${why}`);
   }
   const kind = classify(res.status);
   if (kind !== 'ok') return { kind };
@@ -245,30 +252,53 @@ export async function requestTriage(
   }
 }
 
+/** The §10 triage call. `data` is Anthropic's JSON, unmodified. */
+export function requestTriage(
+  apiKey: string,
+  body: TriageBody,
+): Promise<AnthropicOutcome<unknown>> {
+  return callLatestHaiku(apiKey, 'triage', TIMEOUT_MS, (model) => ({
+    model,
+    max_tokens: MAX_TOKENS,
+    system: SYSTEM_PROMPT,
+    messages: [
+      {
+        role: 'user',
+        content: JSON.stringify({
+          tasks: body.tasks,
+          available_minutes: body.available_minutes,
+          timezone: body.timezone,
+        }),
+      },
+    ],
+  }));
+}
+
+/**
+ * The chunk-90 sort call: one request, temperature 0, output forced through
+ * the `propose_sorting` tool. `payload` is the user message (tasks + lists).
+ */
+export function requestSort(apiKey: string, payload: unknown): Promise<AnthropicOutcome<unknown>> {
+  return callLatestHaiku(apiKey, 'sort', SORT_TIMEOUT_MS, (model) => ({
+    model,
+    max_tokens: SORT_MAX_TOKENS,
+    temperature: 0,
+    system: SORT_SYSTEM_PROMPT,
+    tools: [SORT_TOOL],
+    tool_choice: { type: 'tool', name: SORT_TOOL_NAME },
+    messages: [{ role: 'user', content: JSON.stringify(payload) }],
+  }));
+}
+
 function postMessages(
   apiKey: string,
-  model: string,
-  body: TriageBody,
+  body: Record<string, unknown>,
   signal: AbortSignal,
 ): Promise<Response> {
   return fetch(`${ANTHROPIC_BASE}/messages`, {
     method: 'POST',
     headers: { ...anthropicHeaders(apiKey), 'content-type': 'application/json' },
-    body: JSON.stringify({
-      model,
-      max_tokens: MAX_TOKENS,
-      system: SYSTEM_PROMPT,
-      messages: [
-        {
-          role: 'user',
-          content: JSON.stringify({
-            tasks: body.tasks,
-            available_minutes: body.available_minutes,
-            timezone: body.timezone,
-          }),
-        },
-      ],
-    }),
+    body: JSON.stringify(body),
     signal,
   });
 }
@@ -289,4 +319,10 @@ async function selectColumn(userId: string, column: string): Promise<string | nu
 /** The stored key ciphertext (`bytea`, `\x`-hex transport), or null. */
 export function getEncryptedAiKey(userId: string): Promise<string | null> {
   return selectColumn(userId, 'ai_api_key_encrypted');
+}
+
+/** The caller's Anthropic key: the decrypted stored key, or null. */
+export async function loadAiKey(userId: string): Promise<string | null> {
+  const stored = await getEncryptedAiKey(userId);
+  return stored ? decrypt(byteaToBuffer(stored)) : null;
 }
