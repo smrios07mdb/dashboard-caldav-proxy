@@ -58,6 +58,12 @@ export default {
     if (outcome.kind === 'upstream') {
       return jsonResponse(req, 502, { ok: false, error: 'upstream' });
     }
+    // A cut-off tool call can still parse; never write a partial batch.
+    const stop = (outcome.data as { stop_reason?: unknown } | null)?.stop_reason;
+    if (stop === 'max_tokens') {
+      console.log('sort truncated status=200 stop_reason=max_tokens');
+      return jsonResponse(req, 502, { ok: false, error: 'truncated' });
+    }
     const call = readToolCall(outcome.data);
     if (!call) return jsonResponse(req, 502, { ok: false, error: 'malformed' });
 

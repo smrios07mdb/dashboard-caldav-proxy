@@ -40,7 +40,7 @@ origins in `ALLOWED_ORIGINS`.
 | `POST /api/ai/key`                    | `{ api_key }`                                             | `{ ok: true }` (validated with Anthropic, stored encrypted)                               | `422 { error: "bad_key" }`, `502 { error: "upstream" }`, `400`                                 |
 | `DELETE /api/ai/key`                  | —                                                         | `{ ok: true }`                                                                            | —                                                                                              |
 | `POST /api/ai/triage`                 | `{ tasks, available_minutes, timezone }`                  | `{ ok: true, data }` (`data` = Anthropic Messages JSON, unmodified)                       | `412 { error: "missing_key" }`, `422 { error: "bad_key" }`, `502 { error: "upstream" }`, `400` |
-| `POST /api/ai/sort`                   | —                                                         | `{ ok, run_id, proposed, kept, skipped, remaining, usage }` (chunk 90)                    | `412`, `422 { error: "bad_key" }`, `502 { error: "upstream" \| "malformed" }`                  |
+| `POST /api/ai/sort`                   | —                                                         | `{ ok, run_id, proposed, kept, skipped, remaining, usage }` (chunk 90)                    | `412`, `422 { error: "bad_key" }`, `502 { error: "upstream" \| "malformed" \| "truncated" }`   |
 
 Missing/invalid JWT → `401 { ok: false, error: "unauthorized" }`. Upstream
 iCloud network/other failures → `502 { ok: false, error: "network" | "other" }`.
@@ -240,7 +240,7 @@ targets and proposal rules as above (`router.ts` takes a `RouterScope`
 `{ userId, minAgeMinutes }`), with the 10-minute age filter **off**. The proxy
 asks the latest Haiku (chunk-57 resolver) with the saved key: one request,
 no sampling parameters (Haiku 5.5 rejects a non-default `temperature` with
-a 400), `max_tokens 4000`, output forced through the
+a 400), `max_tokens 12000`, output forced through the
 `propose_sorting` tool (prompt and schema in `api/_lib/sortPrompt.ts`). At
 most 100 candidates per press, oldest first.
 
@@ -252,7 +252,8 @@ most 100 candidates per press, oldest first.
   Anthropic call.
 - `412 missing_key`, `422 bad_key` (sets `ai_status = 'auth_failed'`),
   `502 upstream`, `502 malformed` (no `propose_sorting` call, or its input is
-  not `{ proposals: [...] }`), `401` without a valid JWT.
+  not `{ proposals: [...] }`), `502 truncated` (Anthropic stopped at
+  `max_tokens`; nothing is written), `401` without a valid JWT.
 - Runs with `maxDuration: 60` (`vercel.json`; the specific pattern must come
   before `api/**/*.ts`) and answers `upstream` itself at 50 s.
 

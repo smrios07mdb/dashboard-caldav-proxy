@@ -254,6 +254,18 @@ describe('POST /api/ai/sort — auth and key (D1, D5)', () => {
     expect(logged).toContain('sort upstream thrown=TimeoutError');
   });
 
+  it('stop_reason max_tokens → 502 truncated (not malformed); logs no body', async () => {
+    routeFetch(modelsPage('m-new'), [
+      toolReply([{ ...keep(1), reason: 'secret task title here' }], { stop_reason: 'max_tokens' }),
+    ]);
+    const res = await send();
+    expect(res.status).toBe(502);
+    expect(((await res.json()) as SortJson).error).toBe('truncated');
+    expect(insertProposals).not.toHaveBeenCalled();
+    expect(logged).toContain('sort truncated status=200 stop_reason=max_tokens');
+    expect(logged.join('\n')).not.toContain('secret task title');
+  });
+
   it('acts on the JWT user, not ROUTER_USER_ID', async () => {
     routeFetch(modelsPage('m-new'), [toolReply([keep(1)])]);
     await send();
@@ -335,8 +347,9 @@ describe('POST /api/ai/sort — model call (D3)', () => {
     expect(b).not.toHaveProperty('temperature');
     expect(b).not.toHaveProperty('top_p');
     expect(b).not.toHaveProperty('top_k');
-    expect(b.max_tokens).toBe(4000);
-    expect(SORT_MAX_TOKENS).toBe(4000);
+    // ~77 output tokens per task × 100 candidates ≈ 7,700; 12,000 leaves headroom.
+    expect(b.max_tokens).toBe(12000);
+    expect(SORT_MAX_TOKENS).toBe(12000);
     expect(b.system).toBe(SORT_SYSTEM_PROMPT);
     expect(b.tools).toEqual([SORT_TOOL]);
     expect(b.tool_choice).toEqual({ type: 'tool', name: 'propose_sorting' });

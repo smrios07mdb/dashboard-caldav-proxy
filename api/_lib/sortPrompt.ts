@@ -10,7 +10,8 @@ import type { ProposeBody } from './router.js';
  */
 
 export const SORT_TOOL_NAME = 'propose_sorting';
-export const SORT_MAX_TOKENS = 4000;
+// ~77 output tokens per task × SORT_BATCH ≈ 7,700; 12,000 leaves headroom.
+export const SORT_MAX_TOKENS = 12_000;
 /** Candidates sent per press (D4); the response reports the rest as `remaining`. */
 export const SORT_BATCH = 100;
 

@@ -26,7 +26,7 @@ const ANTHROPIC_BASE = 'https://api.anthropic.com/v1';
 const ANTHROPIC_VERSION = '2023-06-01';
 // Functions are capped at 15s (vercel.json); fail as `upstream` before that.
 const TIMEOUT_MS = 12_000;
-// Chunk 90: a sort press can write up to 4000 tokens, so `api/ai/sort.ts` runs
+// Chunk 90: a sort press can write up to 12,000 tokens, so `api/ai/sort.ts` runs
 // with a 60 s cap (vercel.json) and answers `upstream` itself at 50 s.
 export const SORT_TIMEOUT_MS = 50_000;
 
