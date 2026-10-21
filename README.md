@@ -193,6 +193,29 @@ priority`). The proxy owns the model, `MAX_TOKENS` (800) and the system
   lazily migrated by triage once, on 2026-10-12; chunk 56 removed every
   reference here and dropped the column.
 
+## General sorting (chunk 89)
+
+A Claude scheduled task (no Anthropic key here — it runs on the user's Claude
+subscription) sorts tasks sitting in a **General** list. It cannot reach
+Supabase, so it talks only to these two endpoints. Both take
+`Authorization: Bearer $ROUTER_TOKEN` (constant-time compare; wrong or missing
+→ 401, env unset → 503) and act only on `ROUTER_USER_ID`'s rows.
+
+- `GET /api/route/inbox` → `{ ok, tasks, targets, categories }`. `tasks`: open
+  tasks in a live list named General (either category), at least 10 minutes
+  old, with no `pending` / `approved` / `kept` proposal; oldest first, max 100.
+  `targets`: every live non-General list, with up to 8 recent task titles.
+- `POST /api/route/propose` with `{ proposals: [{ task_id, subcategory_id |
+null, new_list: { name, category: 'Work' | 'Personal' } | null, reason }] }`
+  (1–100, unique `task_id`). Writes `routing_proposals` rows with status
+  `pending` and one shared `run_id`; returns per-task `proposed` /
+  `kept_fallback` / `skipped`. A new list needs 2+ tasks in the run, at most 3
+  new lists per run; a name matching an existing list in that category becomes
+  that list.
+
+The proxy never moves a task or creates a list — the user approves in the app
+(`apply_routing`, dashboard migration 21). Logic: `api/_lib/router.ts`.
+
 ## Environment variables
 
 Set these in **Vercel → Project → Settings → Environment Variables** (never commit
@@ -206,6 +229,8 @@ real values; `.env.example` holds placeholders). For local dev, copy them into
 | `SUPABASE_JWKS_URL`         | `${SUPABASE_URL}/auth/v1/.well-known/jwks.json`          |
 | `CALDAV_ENCRYPTION_KEY`     | 32-byte base64 key for AES-256-GCM                       |
 | `ALLOWED_ORIGINS`           | Comma-separated CORS origins (scheme+host only, no path) |
+| `ROUTER_TOKEN`              | Bearer for `/api/route/*` (32 random bytes, base64url)   |
+| `ROUTER_USER_ID`            | The one user `/api/route/*` acts on                      |
 
 `ALLOWED_ORIGINS` example: `https://<your-gh-username>.github.io,http://localhost:5173`
 (the dashboard's GitHub Pages origin **without** the `/dashboard/` subpath).
