@@ -239,7 +239,8 @@ empty body, acts on the JWT's user — not `ROUTER_USER_ID`. Same candidates,
 targets and proposal rules as above (`router.ts` takes a `RouterScope`
 `{ userId, minAgeMinutes }`), with the 10-minute age filter **off**. The proxy
 asks the latest Haiku (chunk-57 resolver) with the saved key: one request,
-`temperature 0`, `max_tokens 4000`, output forced through the
+no sampling parameters (Haiku 5.5 rejects a non-default `temperature` with
+a 400), `max_tokens 4000`, output forced through the
 `propose_sorting` tool (prompt and schema in `api/_lib/sortPrompt.ts`). At
 most 100 candidates per press, oldest first.
 

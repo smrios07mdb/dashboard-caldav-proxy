@@ -280,14 +280,15 @@ export function requestTriage(
 }
 
 /**
- * The chunk-90 sort call: one request, temperature 0, output forced through
- * the `propose_sorting` tool. `payload` is the user message (tasks + lists).
+ * The chunk-90 sort call: one request, output forced through the
+ * `propose_sorting` tool. `payload` is the user message (tasks + lists). No
+ * `temperature`: Claude Haiku 5.5 answers 400 to any non-default sampling
+ * parameter.
  */
 export function requestSort(apiKey: string, payload: unknown): Promise<AnthropicOutcome<unknown>> {
   return callLatestHaiku(apiKey, 'sort', SORT_TIMEOUT_MS, (model) => ({
     model,
     max_tokens: SORT_MAX_TOKENS,
-    temperature: 0,
     system: SORT_SYSTEM_PROMPT,
     tools: [SORT_TOOL],
     tool_choice: { type: 'tool', name: SORT_TOOL_NAME },

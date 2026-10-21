@@ -324,14 +324,17 @@ describe('POST /api/ai/sort — candidates (D2, D4)', () => {
 });
 
 describe('POST /api/ai/sort — model call (D3)', () => {
-  it('the model id comes from the resolver; one forced tool call at temperature 0', async () => {
+  it('the model id comes from the resolver; one forced tool call, no sampling params (Haiku 5.5 400s on them)', async () => {
     routeFetch(modelsPage('m-newest', 'm-older'), [toolReply([keep(1)])]);
     const res = await send();
     expect(res.status).toBe(200);
     expect(messagesCalls()).toHaveLength(1);
     const b = sentBody();
     expect(b.model).toBe('m-newest');
-    expect(b.temperature).toBe(0);
+    // Claude Haiku 5.5 rejects any non-default temperature/top_p/top_k with a 400.
+    expect(b).not.toHaveProperty('temperature');
+    expect(b).not.toHaveProperty('top_p');
+    expect(b).not.toHaveProperty('top_k');
     expect(b.max_tokens).toBe(4000);
     expect(SORT_MAX_TOKENS).toBe(4000);
     expect(b.system).toBe(SORT_SYSTEM_PROMPT);
