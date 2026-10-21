@@ -202,6 +202,21 @@ Supabase, so it talks only to these two endpoints. Both take
 `Authorization: Bearer $ROUTER_TOKEN` (constant-time compare; wrong or missing
 → 401, env unset → 503) and act only on `ROUTER_USER_ID`'s rows.
 
+**Where the token lives.** The only copy outside Vercel (where it is
+sensitive, so `vercel env pull` returns it empty) is the operator's macOS
+Keychain: service `dashboard-router-token`, account `hupomnemata` (rotated
+2026-10-21). The scheduled task, when it is created, gets the token from there;
+never paste it into a file, log or transcript:
+
+```sh
+security find-generic-password -a hupomnemata -s dashboard-router-token -w
+```
+
+To rotate: `security add-generic-password -U -a hupomnemata -s dashboard-router-token -w "$(openssl rand -hex 32)"`,
+then `vercel env rm ROUTER_TOKEN production --yes`, pipe the Keychain value
+(`| tr -d '\n' |`) into `vercel env add ROUTER_TOKEN production --sensitive`,
+and `vercel --prod`.
+
 - `GET /api/route/inbox` → `{ ok, tasks, targets, categories }`. `tasks`: open
   tasks in a live list named General (either category), at least 10 minutes
   old, with no `pending` / `approved` / `kept` proposal; oldest first, max 100.
@@ -246,15 +261,15 @@ Set these in **Vercel → Project → Settings → Environment Variables** (neve
 real values; `.env.example` holds placeholders). For local dev, copy them into
 `.env.local`.
 
-| Var                         | Purpose                                                  |
-| --------------------------- | -------------------------------------------------------- |
-| `SUPABASE_URL`              | Supabase project URL                                     |
-| `SUPABASE_SERVICE_ROLE_KEY` | Service role key — server-only, bypasses RLS             |
-| `SUPABASE_JWKS_URL`         | `${SUPABASE_URL}/auth/v1/.well-known/jwks.json`          |
-| `CALDAV_ENCRYPTION_KEY`     | 32-byte base64 key for AES-256-GCM                       |
-| `ALLOWED_ORIGINS`           | Comma-separated CORS origins (scheme+host only, no path) |
-| `ROUTER_TOKEN`              | Bearer for `/api/route/*` (32 random bytes, base64url)   |
-| `ROUTER_USER_ID`            | The one user `/api/route/*` acts on                      |
+| Var                         | Purpose                                                    |
+| --------------------------- | ---------------------------------------------------------- |
+| `SUPABASE_URL`              | Supabase project URL                                       |
+| `SUPABASE_SERVICE_ROLE_KEY` | Service role key — server-only, bypasses RLS               |
+| `SUPABASE_JWKS_URL`         | `${SUPABASE_URL}/auth/v1/.well-known/jwks.json`            |
+| `CALDAV_ENCRYPTION_KEY`     | 32-byte base64 key for AES-256-GCM                         |
+| `ALLOWED_ORIGINS`           | Comma-separated CORS origins (scheme+host only, no path)   |
+| `ROUTER_TOKEN`              | Bearer for `/api/route/*` (32 random bytes, hex; Keychain) |
+| `ROUTER_USER_ID`            | The one user `/api/route/*` acts on                        |
 
 `ALLOWED_ORIGINS` example: `https://<your-gh-username>.github.io,http://localhost:5173`
 (the dashboard's GitHub Pages origin **without** the `/dashboard/` subpath).
