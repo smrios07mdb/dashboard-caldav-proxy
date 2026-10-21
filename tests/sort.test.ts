@@ -229,6 +229,31 @@ describe('POST /api/ai/sort — auth and key (D1, D5)', () => {
     expect(((await res.json()) as SortJson).error).toBe('upstream');
   });
 
+  it('an upstream failure logs the Anthropic status and error type, never the body', async () => {
+    routeFetch(modelsPage('m-new'), [
+      () =>
+        json(400, {
+          type: 'error',
+          error: { type: 'invalid_request_error', message: 'secret task title here' },
+        }),
+    ]);
+    const res = await send();
+    expect(res.status).toBe(502);
+    expect(logged).toContain('sort upstream status=400:invalid_request_error');
+    expect(logged.join('\n')).not.toContain('secret task title');
+  });
+
+  it('a thrown Messages call (timeout) logs its error name', async () => {
+    routeFetch(modelsPage('m-new'), [
+      () => {
+        throw new DOMException('timed out', 'TimeoutError');
+      },
+    ]);
+    const res = await send();
+    expect(res.status).toBe(502);
+    expect(logged).toContain('sort upstream thrown=TimeoutError');
+  });
+
   it('acts on the JWT user, not ROUTER_USER_ID', async () => {
     routeFetch(modelsPage('m-new'), [toolReply([keep(1)])]);
     await send();

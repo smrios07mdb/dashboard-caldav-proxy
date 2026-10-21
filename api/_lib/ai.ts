@@ -237,13 +237,18 @@ async function callLatestHaiku(
       resolved = await resolveHaikuModel(apiKey, signal);
       res = await postMessages(apiKey, build(resolved.model), signal);
     }
-  } catch {
+  } catch (err) {
+    console.log(`${label} upstream thrown=${err instanceof Error ? err.name : 'unknown'}`);
     return { kind: 'upstream' };
   } finally {
     const why = resolved.reason ? ` reason=${resolved.reason}` : '';
     console.log(`${label} model=${resolved.model} source=${resolved.source}${why}`);
   }
   const kind = classify(res.status);
+  if (kind === 'upstream') {
+    // Status and Anthropic's error type only: the message can echo task content.
+    console.log(`${label} upstream status=${res.status}${await errorType(res)}`);
+  }
   if (kind !== 'ok') return { kind };
   try {
     return { kind, data: await res.json() };
