@@ -26,7 +26,8 @@ export const INBOX_LIMIT = 100;
 export const EXAMPLES_PER_TARGET = 8;
 export const EXAMPLE_WINDOW_DAYS = 90;
 export const NEW_LIST_MIN_TASKS = 2;
-export const NEW_LISTS_PER_RUN = 3;
+// Chunk 90a: 3 → 8, so a press can empty General into new lists.
+export const NEW_LISTS_PER_RUN = 8;
 
 // ── auth ──────────────────────────────────────────────────────────────────
 
@@ -378,7 +379,7 @@ export function planProposals(
     results.set(p.task_id, { task_id: p.task_id, status: 'proposed' });
   });
 
-  // D3: a new list needs ≥2 tasks; at most 3 new lists (largest first).
+  // D3: a new list needs ≥2 tasks; at most NEW_LISTS_PER_RUN new lists (largest first).
   const fallback = (g: Group, detail: string) => {
     for (const { t, reason } of g.items) {
       rows.push(row(t, reason, null, null));

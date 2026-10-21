@@ -225,8 +225,8 @@ and `vercel --prod`.
 null, new_list: { name, category: 'Work' | 'Personal' } | null, reason }] }`
   (1–100, unique `task_id`). Writes `routing_proposals` rows with status
   `pending` and one shared `run_id`; returns per-task `proposed` /
-  `kept_fallback` / `skipped`. A new list needs 2+ tasks in the run, at most 3
-  new lists per run; a name matching an existing list in that category becomes
+  `kept_fallback` / `skipped`. A new list needs 2+ tasks in the run, at most 8
+  new lists per run (3 before chunk 90a); a name matching an existing list in that category becomes
   that list.
 
 The proxy never moves a task or creates a list — the user approves in the app
@@ -240,9 +240,12 @@ targets and proposal rules as above (`router.ts` takes a `RouterScope`
 `{ userId, minAgeMinutes }`), with the 10-minute age filter **off**. The proxy
 asks the latest Haiku (chunk-57 resolver) with the saved key: one request,
 no sampling parameters (Haiku 5.5 rejects a non-default `temperature` with
-a 400), `max_tokens 12000`, output forced through the
-`propose_sorting` tool (prompt and schema in `api/_lib/sortPrompt.ts`). At
-most 100 candidates per press, oldest first.
+a 400), thinking disabled (as for triage), `max_tokens 12000`, output forced
+through the `propose_sorting` tool (prompt and schema in
+`api/_lib/sortPrompt.ts`). At most 100 candidates per press, oldest first.
+Since chunk 90a the prompt aims to empty General: it decides Work or Personal
+from each task's content first, then picks an existing list in that category,
+else a new one (up to 8 per run); keeping a task is the exception.
 
 - `200 { ok, run_id, proposed, kept, skipped, remaining, usage }` — `proposed`
   rows have a destination, `kept` rows stay in General, `skipped` entries were

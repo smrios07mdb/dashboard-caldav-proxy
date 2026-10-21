@@ -10,6 +10,7 @@ import {
   buildInbox,
   insertProposals,
   loadSnapshot,
+  NEW_LISTS_PER_RUN,
   planProposals,
   ProposeBody,
   type Snapshot,
@@ -286,30 +287,48 @@ describe('propose (D3, D4, D5)', () => {
     expect(results.map((r) => r.status)).toEqual(['kept_fallback', 'kept_fallback']);
   });
 
-  it('at most 3 new lists per run: the largest win, ties by first appearance', () => {
-    const tasks = Array.from({ length: 10 }, (_, i) => task(i + 1));
+  it('at most 8 new lists per run (chunk 90a): 8 groups all proposed, the 9th falls back', () => {
+    const names = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'];
+    const tasks = Array.from({ length: 18 }, (_, i) => task(i + 1));
     const snap = snapshot({ generalTasks: tasks });
     const { rows, results } = planProposals(
       snap,
+      body(names.flatMap((n, i) => [newList(2 * i + 1, n), newList(2 * i + 2, n)])),
+      SCOPE,
+      NOW,
+    );
+    expect(NEW_LISTS_PER_RUN).toBe(8);
+    expect(new Set(rows.filter((r) => r.new_list_name).map((r) => r.new_list_name))).toEqual(
+      new Set(names.slice(0, 8)),
+    );
+    expect(results.slice(0, 16).every((r) => r.status === 'proposed')).toBe(true);
+    expect(results.slice(16).map((r) => [r.status, r.detail])).toEqual([
+      ['kept_fallback', 'new_list_max'],
+      ['kept_fallback', 'new_list_max'],
+    ]);
+    expect(rows).toHaveLength(18);
+  });
+
+  it('past the cap the largest new lists win, ties by first appearance', () => {
+    const tasks = Array.from({ length: 19 }, (_, i) => task(i + 1));
+    const snap = snapshot({ generalTasks: tasks });
+    // A–H have 2 tasks each; I has 3, so it outranks the last tie (H).
+    const names = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'];
+    const { rows, results } = planProposals(
+      snap,
       body([
-        newList(1, 'A'),
-        newList(2, 'A'),
-        newList(3, 'B'),
-        newList(4, 'B'),
-        newList(5, 'C'),
-        newList(6, 'C'),
-        newList(7, 'D'),
-        newList(8, 'D'),
-        newList(9, 'D'),
+        ...names.flatMap((n, i) => [newList(2 * i + 1, n), newList(2 * i + 2, n)]),
+        newList(17, 'I'),
+        newList(18, 'I'),
+        newList(19, 'I'),
       ]),
       SCOPE,
       NOW,
     );
     expect(new Set(rows.filter((r) => r.new_list_name).map((r) => r.new_list_name))).toEqual(
-      new Set(['D', 'A', 'B']),
+      new Set(['I', 'A', 'B', 'C', 'D', 'E', 'F', 'G']),
     );
-    expect(results.slice(4, 6).map((r) => r.detail)).toEqual(['new_list_max', 'new_list_max']);
-    expect(rows).toHaveLength(9);
+    expect(results.slice(14, 16).map((r) => r.detail)).toEqual(['new_list_max', 'new_list_max']);
   });
 
   it('one run id and pending status on every row; endpoint inserts them', async () => {

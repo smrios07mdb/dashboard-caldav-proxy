@@ -347,6 +347,8 @@ describe('POST /api/ai/sort — model call (D3)', () => {
     expect(b).not.toHaveProperty('temperature');
     expect(b).not.toHaveProperty('top_p');
     expect(b).not.toHaveProperty('top_k');
+    // Chunk 90a: Haiku 5.5 thinks by default; off, as for triage (934dcbc).
+    expect(b.thinking).toEqual({ type: 'disabled' });
     // ~77 output tokens per task × 100 candidates ≈ 7,700; 12,000 leaves headroom.
     expect(b.max_tokens).toBe(12000);
     expect(SORT_MAX_TOKENS).toBe(12000);
@@ -363,16 +365,32 @@ describe('POST /api/ai/sort — model call (D3)', () => {
     expect(sentBody().model).toBe(HAIKU_FLOOR);
   });
 
-  it('the system prompt carries the D3 rules', () => {
+  it('the system prompt carries the chunk-90a rules', () => {
     for (const rule of [
-      /≥ ?2|at least 2|two or more/i,
-      /at most 3/i,
+      /empty the General lists/i,
+      /Work or Personal/,
+      /ignoring which General list/i,
+      /MDB Capital/,
+      /at least 2 tasks/i,
       /3 words/i,
+      /Title Case/,
+      /same exact spelling/i,
       /120/,
       /never invent/i,
     ]) {
       expect(SORT_SYSTEM_PROMPT).toMatch(rule);
     }
+    // Superseded: chunk 90 D3's keep-when-unsure rule and chunk 89 D3's cap of 3.
+    expect(SORT_SYSTEM_PROMPT).not.toMatch(/unsure[^.]*keep/i);
+    expect(SORT_SYSTEM_PROMPT).not.toMatch(/at most 3 new lists/i);
+    expect(SORT_SYSTEM_PROMPT).not.toMatch(/sparingly/i);
+  });
+
+  it('Work/Personal is step 1, before choosing a list', () => {
+    const p = SORT_SYSTEM_PROMPT;
+    expect(p.indexOf('Step 1')).toBeGreaterThan(-1);
+    expect(p.indexOf('Step 1')).toBeLessThan(p.indexOf('Step 2'));
+    expect(p.slice(p.indexOf('Step 1'), p.indexOf('Step 2'))).toMatch(/Work or Personal/);
   });
 });
 
@@ -403,21 +421,14 @@ describe('POST /api/ai/sort — validating model output (D3, D5)', () => {
     expect(inserted().find((r) => r.task_id === id(101))?.to_subcategory_id).toBe(TAXES);
   });
 
-  it('a new list needs 2 tasks; at most 3 new lists; overflow is kept', async () => {
-    const tasks = Array.from({ length: 10 }, (_, i) => task(i + 1));
+  it('a new list needs 2 tasks; at most 8 new lists (chunk 90a); overflow is kept', async () => {
+    const tasks = Array.from({ length: 19 }, (_, i) => task(i + 1));
     vi.mocked(loadSnapshot).mockResolvedValue(snapshot({ generalTasks: tasks }));
+    const groups = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'];
     routeFetch(modelsPage('m-new'), [
       toolReply([
         newList(1, 'Solo'),
-        newList(2, 'A'),
-        newList(3, 'A'),
-        newList(4, 'B'),
-        newList(5, 'B'),
-        newList(6, 'C'),
-        newList(7, 'C'),
-        newList(8, 'D'),
-        newList(9, 'D'),
-        newList(10, 'D'),
+        ...groups.flatMap((g, i) => [newList(2 * i + 2, g), newList(2 * i + 3, g)]),
       ]),
     ]);
     const body = (await (await send()).json()) as SortJson;
@@ -426,8 +437,9 @@ describe('POST /api/ai/sort — validating model output (D3, D5)', () => {
         .filter((r) => r.new_list_name)
         .map((r) => r.new_list_name),
     );
-    expect(names).toEqual(new Set(['D', 'A', 'B']));
-    expect(body).toMatchObject({ proposed: 7, kept: 3, skipped: 0 });
+    expect(names).toEqual(new Set(groups.slice(0, 8)));
+    // Solo (min 2) and the 9th group (cap) fall back to keep.
+    expect(body).toMatchObject({ proposed: 16, kept: 3, skipped: 0 });
   });
 
   it('a new-list name matching an existing list becomes that list', async () => {

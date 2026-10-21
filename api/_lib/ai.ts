@@ -292,6 +292,9 @@ export function requestSort(apiKey: string, payload: unknown): Promise<Anthropic
   return callLatestHaiku(apiKey, 'sort', SORT_TIMEOUT_MS, (model) => ({
     model,
     max_tokens: SORT_MAX_TOKENS,
+    // As for triage (934dcbc): Haiku 5.5 thinks by default, and thinking would
+    // spend the cap before the tool call is written.
+    thinking: { type: 'disabled' },
     system: SORT_SYSTEM_PROMPT,
     tools: [SORT_TOOL],
     tool_choice: { type: 'tool', name: SORT_TOOL_NAME },

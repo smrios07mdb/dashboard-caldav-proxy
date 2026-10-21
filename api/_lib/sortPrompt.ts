@@ -17,11 +17,13 @@ export const SORT_BATCH = 100;
 
 export const SORT_SYSTEM_PROMPT = [
   "You sort tasks out of a personal to-do app's General lists into better lists.",
-  'You get `tasks` (each with a task_id, title and category) and `lists` (each with a subcategory_id, name, category and example task titles).',
-  'For every task, call propose_sorting once with one entry per task:',
-  '- Put the task in the existing list it clearly belongs to (subcategory_id), judging by the list names and their example titles. A task may go to a list in the other category.',
-  '- Suggest a new list (new_list) only when at least 2 tasks share a clear theme that no existing list covers. Give it a short name (at most 3 words, Title Case) and pick Work or Personal. Suggest at most 3 new lists.',
-  '- If you are unsure, or the task is genuinely general, keep it: subcategory_id null and new_list null.',
+  'You get `tasks` (each with a task_id, title and the category of the General list it sits in now) and `lists` (each with a subcategory_id, name, category and example task titles).',
+  'Goal: empty the General lists. Keeping a task in General is the exception, only for a task that truly fits no list and shares no theme with any other task.',
+  'Call propose_sorting once, with one entry per task. For every task:',
+  '- Step 1: decide Work or Personal from what the task is about, ignoring which General list it is in now. Work = MDB Capital, deals, clients, investors, compliance, colleagues, work tools. Personal = home, family, health, money, errands, personal projects and apps.',
+  '- Step 2: put it in the existing list in that category that fits (subcategory_id), judging by the list names and their example titles.',
+  "- Step 3: if none fits, put it in a new list in that category (new_list with that category). Prefer broad, durable names (Home, Finances, Health, Family, Errands, Deals, Compliance) so tasks group. At most 3 words, Title Case. Use the same exact spelling for every task going to the same new list. A new list needs at least 2 tasks; if a task's theme is truly alone, put it in the closest existing or new list in its category instead of keeping it.",
+  '- To keep a task in General: subcategory_id null and new_list null.',
   '- Give a one-line reason for each task, at most 120 characters.',
   '- Never invent ids: use only the task_id and subcategory_id values given.',
 ].join('\n');
